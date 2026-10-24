@@ -57,8 +57,12 @@ python3 code/main.py --requests dataset/sample_deletion_requests.csv --compare-s
 python3 code/main.py --inspect-evidence case_33
 python3 code/main.py --investigate-case case_05
 python3 code/main.py --plan-case case_05
+python3 code/main.py --diagnose-coverage
+python3 code/main.py --requests dataset/sample_deletion_requests.csv --diagnose-coverage
 python3 -m unittest discover -s code -p 'test_*.py'
 ```
+
+`--diagnose-coverage` summarizes cases that can be planned, are not deletion requests, are blocked by missing identity/evidence, or encounter a separate processing error. It prints blocked/error case IDs and reasons and does not create or modify `output.csv`.
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 

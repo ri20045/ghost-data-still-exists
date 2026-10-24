@@ -159,6 +159,13 @@ class OutputRow:
 
 
 @dataclass(frozen=True)
+class CaseCoverageDiagnostic:
+    case_id: str
+    outcome: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class IdentityChange:
     audit_id: str
     event_time: datetime
@@ -1001,6 +1008,59 @@ def orchestrate_case(
     return plan_investigation(case, investigation, rules)
 
 
+def _missing_evidence_reason(error: ContractError) -> str | None:
+    message = str(error)
+    normalized = message.casefold()
+    if "no identity found for request email" in normalized:
+        return "no matching participant-facing identity record"
+    if "no evidence-backed resources establish" in normalized:
+        return "no linked evidence establishes a resource state"
+    if "has no evidence for its reconstructed state" in normalized:
+        return "resource state has no supporting evidence"
+    if "retention cutoff is unknown" in normalized:
+        return message.split(": ", 1)[-1]
+    if "legal-hold status is unknown" in normalized:
+        return message.split(": ", 1)[-1]
+    if "not evidenced as present" in normalized:
+        return message.split(": ", 1)[-1]
+    if "state is unknown" in normalized:
+        return message.split(": ", 1)[-1]
+    return None
+
+
+def diagnose_case_coverage(
+    cases: Iterable[AuditCase],
+    identity_resolver: IdentityResolver,
+    evidence_index: EvidenceIndex,
+    activity_index: ActivityIndex,
+    rules: Iterable[DeletionRule],
+) -> tuple[CaseCoverageDiagnostic, ...]:
+    """Summarize case outcomes without writing predictions or suppressing errors."""
+    rules_list = list(rules)
+    diagnostics = []
+    for case in cases:
+        try:
+            result = orchestrate_case(
+                case, identity_resolver, evidence_index, activity_index, rules_list
+            )
+        except ContractError as error:
+            reason = _missing_evidence_reason(error)
+            if reason is not None:
+                outcome = "BLOCKED"
+            elif "maps to multiple users" in str(error).casefold():
+                outcome = "ERROR"
+                reason = "request identifier maps to multiple identity records"
+            else:
+                outcome = "ERROR"
+                reason = str(error)
+            diagnostics.append(CaseCoverageDiagnostic(case.case_id, outcome, reason))
+        else:
+            diagnostics.append(
+                CaseCoverageDiagnostic(case.case_id, result.deletion_status)
+            )
+    return tuple(diagnostics)
+
+
 def make_step(
     phase: str, system_id: str, resource_id: str, operation: str, state: str, evidence_id: str
 ) -> dict[str, Any]:
@@ -1575,6 +1635,11 @@ def main() -> int:
     parser.add_argument("--inspect-evidence", metavar="CASE_ID", help="count text evidence linked to a resolved case at audit_at")
     parser.add_argument("--investigate-case", metavar="CASE_ID", help="list evidence-grounded resource candidates and activity claims")
     parser.add_argument("--plan-case", metavar="CASE_ID", help="build a policy-based plan for an investigated case")
+    parser.add_argument(
+        "--diagnose-coverage",
+        action="store_true",
+        help="summarize resolved, non-deletion, and evidence-blocked cases without writing output",
+    )
     args = parser.parse_args()
 
     try:
@@ -1612,6 +1677,27 @@ def main() -> int:
                 )
                 plan = plan_investigation(case, investigation, load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"))
                 print(f"Planned {plan.case_id}: {plan.deletion_status} with {len(plan.steps)} ordered step(s).")
+        if args.diagnose_coverage:
+            diagnostics = diagnose_case_coverage(
+                cases,
+                load_identity_resolver(DATASET_ROOT / "user_identities.csv", DATASET_ROOT / "user_audit_log.csv"),
+                load_evidence_index(DATASET_ROOT / "evidence_files.csv"),
+                load_activity_index(DATASET_ROOT / "system_activity.csv"),
+                load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"),
+            )
+            counts = {
+                outcome: sum(item.outcome == outcome for item in diagnostics)
+                for outcome in ("COMPLETE", "INCOMPLETE", "NOT_APPLICABLE", "BLOCKED", "ERROR")
+            }
+            print(f"Coverage diagnostic for {len(diagnostics)} request(s):")
+            for outcome, count in counts.items():
+                print(f"  {outcome}: {count}")
+            for outcome in ("BLOCKED", "ERROR"):
+                entries = [item for item in diagnostics if item.outcome == outcome]
+                if entries:
+                    print(f"{outcome} cases:")
+                    for item in entries:
+                        print(f"  {item.case_id}: {item.reason}")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

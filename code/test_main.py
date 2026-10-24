@@ -1,15 +1,17 @@
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from main import (
     ActivityEvent,
     ActivityIndex,
     AuditCase,
     CaseInvestigation,
+    CaseCoverageDiagnostic,
     ContractError,
     DeletionRule,
+    diagnose_case_coverage,
     EvidenceFile,
     EvidenceIndex,
     OutputRow,
@@ -35,6 +37,45 @@ DATASET = ROOT / "dataset"
 
 
 class ContractTests(unittest.TestCase):
+    def test_coverage_diagnostic_separates_blocked_cases_from_errors(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please delete my account.",
+            )
+            for index in range(1, 5)
+        ]
+        expected = (
+            OutputRow("case_1", "COMPLETE", [{"step_no": 1}]),
+            ContractError("case_2: retention cutoff is unknown for audit_record_002"),
+            ContractError("case_3: no deletion rule for category USER_PROFILE"),
+            OutputRow("case_4", "NOT_APPLICABLE", []),
+        )
+        with patch("main.orchestrate_case", side_effect=expected):
+            diagnostics = diagnose_case_coverage(
+                cases, Mock(), EvidenceIndex([]), ActivityIndex([]), []
+            )
+
+        self.assertEqual(
+            (
+                CaseCoverageDiagnostic("case_1", "COMPLETE"),
+                CaseCoverageDiagnostic(
+                    "case_2", "BLOCKED", "retention cutoff is unknown for audit_record_002"
+                ),
+                CaseCoverageDiagnostic(
+                    "case_3", "ERROR", "case_3: no deletion rule for category USER_PROFILE"
+                ),
+                CaseCoverageDiagnostic("case_4", "NOT_APPLICABLE"),
+            ),
+            diagnostics,
+        )
+
     def test_loads_and_sorts_all_evaluation_requests(self):
         cases = load_requests(DATASET / "deletion_requests.csv")
         self.assertEqual(518, len(cases))

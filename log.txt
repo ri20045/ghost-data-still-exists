@@ -662,3 +662,28 @@ branch=main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=/Users/riyarawat/hackerrank-orchestrate-october26
 parent_agent=none
+
+## [2026-10-25T00:59:49+05:30] Adding evidence coverage diagnostic
+
+User Prompt (verbatim, secrets redacted):
+**Next small feature:** Add a diagnostic that summarizes which cases remain blocked by missing evidence—without generating or writing `output.csv`.
+
+implement this feature
+
+Agent Response Summary:
+Added a `--diagnose-coverage` CLI mode that runs the existing single-case orchestration across the selected request file and reports totals for COMPLETE, INCOMPLETE, NOT_APPLICABLE, BLOCKED, and ERROR outcomes. It lists blocked cases and concise reasons separately from unrelated processing errors, and never writes output.csv. The default 518-request diagnostic found 216 evidence-blocked cases, 74 COMPLETE, 218 INCOMPLETE, 10 NOT_APPLICABLE, and no processing errors; the root output.csv remains absent.
+
+Actions:
+* Edited README.md, code/main.py, and code/test_main.py.
+* Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s code -p 'test_*.py'` (37 tests passed).
+* Ran `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile code/main.py code/test_main.py` and `git diff --check` (passed).
+* Ran `PYTHONDONTWRITEBYTECODE=1 python3 code/main.py --requests dataset/sample_deletion_requests.csv --diagnose-coverage` (32 requests summarized; 14 blocked) and `PYTHONDONTWRITEBYTECODE=1 python3 code/main.py --diagnose-coverage` (all 518 summarized; no errors).
+* Verified root output.csv was not created. Did not perform Git write operations.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none
