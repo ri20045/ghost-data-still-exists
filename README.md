@@ -37,6 +37,16 @@ Run the starter Python entry point with:
 python3 code/main.py
 ```
 
+At the foundation stage, this command validates the 518-request input contract.
+Use the following during development to validate a generated output or compare a
+sample prediction with the provided sample answer:
+
+```bash
+python3 code/main.py --validate-output output.csv
+python3 code/main.py --requests dataset/sample_deletion_requests.csv --compare-sample path/to/sample_prediction.csv
+python3 -m unittest discover -s code -p 'test_*.py'
+```
+
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
 
