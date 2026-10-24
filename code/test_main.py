@@ -671,7 +671,11 @@ class ContractTests(unittest.TestCase):
                 '2026-01-03T00:00:04Z {"resource_id":"backup_001",'
                 '"restore_allowed":"false"}\n'
                 '2026-01-03T00:00:05Z {"resource_id":"export_001",'
-                '"available":"true"}'
+                '"available":"true"}\n'
+                '2026-01-03T00:00:06Z {"resource_id":"account_002",'
+                '"event":"profile_lookup_completed","rows":"0","http_status":"404"}\n'
+                '2026-01-03T00:00:07Z {"resource_id":"account_003",'
+                '"event":"profile_lookup_completed","rows":"1","http_status":"200"}'
             ),
         )
         resource_ids = (
@@ -681,6 +685,8 @@ class ContractTests(unittest.TestCase):
             "data_flow_001",
             "backup_001",
             "export_001",
+            "account_002",
+            "account_003",
         )
         resources = reconstruct_resource_states(
             [
@@ -691,7 +697,16 @@ class ContractTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["PRESENT", "PRESENT", "REDACTED", "ACTIVE", "BLOCKED", "PRESENT"],
+            [
+                "PRESENT",
+                "PRESENT",
+                "REDACTED",
+                "ACTIVE",
+                "BLOCKED",
+                "PRESENT",
+                "ABSENT",
+                "PRESENT",
+            ],
             [resource.observed_state for resource in resources],
         )
 

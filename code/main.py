@@ -684,7 +684,8 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
         available = record.get("available", record.get("download_available"))
         if available is True or isinstance(available, str) and available.casefold() == "true":
             return "PRESENT"
-    if record.get("status_code") == 404:
+    http_status = record.get("status_code", record.get("http_status"))
+    if str(http_status).isdigit() and int(str(http_status)) == 404:
         return "ABSENT"
     if has_identifier(record):
         return "PRESENT"
@@ -723,6 +724,8 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
             if state != "UNKNOWN":
                 return state
     row_count = record.get("rows", record.get("row_count"))
+    if isinstance(row_count, str) and row_count.isdigit():
+        row_count = int(row_count)
     if row_count == 0:
         return "ABSENT"
     if isinstance(row_count, int) and row_count > 0:

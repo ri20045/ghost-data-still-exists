@@ -20,6 +20,8 @@ Timestamped log lines that contain a complete JSON object are also parsed as str
 
 Quoted key-value log messages are normalized before state checks, including escaped quotes embedded in an outer message field. This allows explicit 404/zero-row lookups, search hits, redaction markers, active-flow flags, and available exports to be reconstructed without treating a missing field as evidence.
 
+Embedded JSON lookup records may encode row counts and HTTP status codes as strings; explicit `"rows":"0"` or HTTP 404 now establishes absence, while a positive row count establishes presence.
+
 For SQL snapshots that define `security_audit_records`, retention cutoffs are read from the `retention_until` column using that table's declared schema and matching resource row. Audit events from other tables or text that only reports an audit record as found do not establish a retention cutoff. The public sample's audit rows that omit this value therefore remain unresolved.
 
 The public sample has a source inconsistency: `sample_output.csv` cites `account_001` and `account_002` in `evidence_54` for its first two cases, but the participant-facing evidence file does not contain those resource IDs. The implementation does not use sample answers to fabricate evidence; clarify or correct this discrepancy before relying on full-dataset completion results.
