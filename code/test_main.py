@@ -7,6 +7,7 @@ from main import (
     ActivityEvent,
     ActivityIndex,
     AuditCase,
+    CaseInvestigation,
     ContractError,
     DeletionRule,
     EvidenceFile,
@@ -91,6 +92,25 @@ class ContractTests(unittest.TestCase):
             identity.all_identifiers, case.audit_at
         )
         self.assertTrue(all(item.captured_at <= case.audit_at for item in matches))
+
+    def test_stable_user_reference_matching_uses_exact_ids(self):
+        captured_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_neighbor",
+                    Path("lookup.log"),
+                    "test_fixture",
+                    captured_at,
+                    "resource_id=audit_record_001 subject_reference=user_437",
+                )
+            ]
+        )
+
+        self.assertEqual([], index.search(["user_43"], captured_at))
+        self.assertEqual(["evidence_neighbor"], [
+            item.file_id for item in index.search(["user_437"], captured_at)
+        ])
 
     def test_loads_activity_and_policy_contracts(self):
         self.assertEqual(4011, len(load_activity_index(DATASET / "system_activity.csv").events))
@@ -230,7 +250,7 @@ class ContractTests(unittest.TestCase):
         validate_output_rows([case], [result])
         resolver.resolve.assert_called_once_with(case.email, case.audit_at)
 
-    def test_reconstructs_explicit_absence_without_claiming_case_complete(self):
+    def test_reconstructs_explicit_absence_and_emits_evidence_backed_completion(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         case = AuditCase(
             case_id="case_fixture",
@@ -271,8 +291,17 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual("ABSENT", investigation.resources[0].observed_state)
         self.assertEqual(("evidence_absent",), investigation.resources[0].state_evidence_ids)
-        with self.assertRaisesRegex(ContractError, "completion evaluation is not implemented"):
-            orchestrate_case(case, resolver, evidence_index, activity_index, [])
+        result = orchestrate_case(
+            case,
+            resolver,
+            evidence_index,
+            activity_index,
+            [DeletionRule("rule_fixture", "USER_PROFILE", "Always", "DELETE")],
+        )
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual("VERIFY_RECORD_ABSENT", result.steps[0]["operation"])
+        self.assertEqual("evidence_absent", result.steps[0]["evidence_id"])
+        validate_output_rows([case], [result])
 
     def test_present_evidence_wins_over_an_absence_claim_from_another_snapshot(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
@@ -383,6 +412,34 @@ class ContractTests(unittest.TestCase):
         )
         self.assertTrue(all(step["evidence_id"] for step in result.steps[:2]))
 
+    def test_reconstructs_sql_backup_restore_flags(self):
+        captured_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_sql_flags",
+            Path("inventory.sql"),
+            "test_fixture",
+            captured_at,
+            (
+                "INSERT INTO backup_restore_entries VALUES "
+                "('backup_001', NULL, 'person@example.test', 'archive/backup_001', '1', "
+                "'2026-01-03T00:00:00Z');\n"
+                "INSERT INTO backup_restore_entries VALUES "
+                "('backup_002', NULL, 'person@example.test', 'archive/backup_002', '0', "
+                "'2026-01-03T00:00:00Z');"
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation("backup_001", ("evidence_sql_flags",), (), None, "UNKNOWN", ()),
+                ResourceObservation("backup_002", ("evidence_sql_flags",), (), None, "UNKNOWN", ()),
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(["RESTORABLE", "BLOCKED"], [
+            resource.observed_state for resource in resources
+        ])
+
     def test_orchestration_rejects_deletion_without_evidence_for_a_finding(self):
         case = AuditCase(
             case_id="case_fixture",
@@ -433,8 +490,384 @@ class ContractTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(ContractError, "no evidence-backed resource state"):
-            orchestrate_case(case, resolver, evidence_index, activity_index, [])
+        with self.assertRaisesRegex(ContractError, "state is unknown"):
+            orchestrate_case(
+                case,
+                resolver,
+                evidence_index,
+                activity_index,
+                [DeletionRule("rule_fixture", "USER_PROFILE", "Always", "DELETE")],
+            )
+
+    def test_policy_completion_preserves_redacted_tombstone_and_retained_audit_record(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_policy",
+            Path("policy.json"),
+            "test_fixture",
+            audit_at,
+            (
+                '{"records":['
+                '{"resource_id":"tombstone_001","subject_reference":"user_001",'
+                '"name":null,"email":null,"phone":null,"email_hash":null,'
+                '"account_status":"DELETED"},'
+                '{"resource_id":"audit_record_001","subject_reference":"user_001",'
+                '"event_name":"ACCOUNT_DELETION_RECORDED",'
+                '"retention_until":"2030-12-31T23:59:59Z"}]}'
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation("tombstone_001", ("evidence_policy",), (), None, "UNKNOWN", ()),
+                ResourceObservation("audit_record_001", ("evidence_policy",), (), None, "UNKNOWN", ()),
+            ],
+            EvidenceIndex([evidence]),
+        )
+        case = AuditCase(
+            "case_policy",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        investigation = CaseInvestigation("case_policy", ("evidence_policy",), resources)
+        rules = [
+            DeletionRule("rule_retained", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN"),
+            DeletionRule("rule_tombstone", "ACCOUNT_TOMBSTONE", "Stable reference", "REDACT"),
+        ]
+
+        result = plan_investigation(case, investigation, rules)
+
+        self.assertEqual("REDACTED", resources[0].observed_state)
+        self.assertEqual("PRESENT", resources[1].observed_state)
+        self.assertEqual(datetime(2030, 12, 31, 23, 59, 59, tzinfo=timezone.utc), resources[1].retention_until)
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual(
+            ["VERIFY_RECORD_PRESENT", "VERIFY_RECORD_REDACTED"],
+            [step["operation"] for step in result.steps],
+        )
+        self.assertTrue(all(step["evidence_id"] == "evidence_policy" for step in result.steps))
+
+    def test_identifiable_tombstone_is_redacted_instead_of_deleted(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_tombstone",
+            Path("snapshot.sql"),
+            "test_fixture",
+            audit_at,
+            (
+                "INSERT INTO records VALUES('tombstone_001','identity_service',"
+                "'deleted_customer_references','{\"resource_id\":\"tombstone_001\","
+                "\"subject_reference\":\"user_001\",\"name\":\"Fixture Person\","
+                "\"email\":\"person@example.test\",\"phone\":null,\"email_hash\":null,"
+                "\"account_status\":\"DELETED\"}','2026-01-03T00:00:00Z');"
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [ResourceObservation("tombstone_001", ("evidence_tombstone",), (), None, "UNKNOWN", ())],
+            EvidenceIndex([evidence]),
+        )
+        case = AuditCase(
+            "case_tombstone",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        result = plan_investigation(
+            case,
+            CaseInvestigation("case_tombstone", ("evidence_tombstone",), resources),
+            [DeletionRule("rule_tombstone", "ACCOUNT_TOMBSTONE", "Stable reference", "REDACT")],
+        )
+
+        self.assertEqual("PRESENT", resources[0].observed_state)
+        self.assertEqual("INCOMPLETE", result.deletion_status)
+        self.assertEqual(
+            ["REPORT_EXPOSED_PII", "REDACT_RECORD", "VERIFY_RECORD_REDACTED"],
+            [step["operation"] for step in result.steps],
+        )
+        self.assertEqual("evidence_tombstone", result.steps[0]["evidence_id"])
+        self.assertEqual(["", ""], [step["evidence_id"] for step in result.steps[1:]])
+
+    def test_orchestration_finds_a_redacted_tombstone_by_stable_user_reference(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_tombstone",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        resolver = Mock()
+        resolver.resolve.return_value = ResolvedIdentity(
+            "user_001",
+            {"name": "", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_tombstone",
+                    Path("snapshot.json"),
+                    "test_fixture",
+                    audit_at,
+                    '{"resource_id":"tombstone_001","subject_reference":"user_001",'
+                    '"name":null,"email":null,"phone":null,"email_hash":null,'
+                    '"account_status":"DELETED"}',
+                )
+            ]
+        )
+
+        result = orchestrate_case(
+            case,
+            resolver,
+            evidence_index,
+            ActivityIndex([]),
+            [DeletionRule("rule_tombstone", "ACCOUNT_TOMBSTONE", "Stable reference", "REDACT")],
+        )
+
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual("VERIFY_RECORD_REDACTED", result.steps[0]["operation"])
+        self.assertEqual("evidence_tombstone", result.steps[0]["evidence_id"])
+
+    def test_anonymized_analytics_record_is_verified_without_remediation(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_analytics",
+            Path("analytics.json"),
+            "test_fixture",
+            audit_at,
+            '{"resource_id":"analytics_001","record_type":"ANALYTICS_PROFILE",'
+            '"result":"ANONYMIZED","subject_reference":""}',
+        )
+        resources = reconstruct_resource_states(
+            [ResourceObservation("analytics_001", ("evidence_analytics",), (), None, "UNKNOWN", ())],
+            EvidenceIndex([evidence]),
+        )
+        case = AuditCase(
+            "case_analytics",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+
+        result = plan_investigation(
+            case,
+            CaseInvestigation("case_analytics", ("evidence_analytics",), resources),
+            [DeletionRule("rule_analytics", "ANALYTICS_PROFILE", "Still attributable", "ANONYMIZE")],
+        )
+
+        self.assertEqual("ANONYMIZED", resources[0].observed_state)
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual("VERIFY_RECORD_ANONYMIZED", result.steps[0]["operation"])
+
+    def test_support_message_redaction_and_analytics_attribution_follow_policy(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_policy_records",
+            Path("policy_records.json"),
+            "test_fixture",
+            audit_at,
+            (
+                '{"records":['
+                '{"resource_id":"support_001","message_text":'
+                '"Please contact person@example.test about the shared order."},'
+                '{"resource_id":"support_002","message_text":"[REDACTED]"},'
+                '{"resource_id":"analytics_001","user_id":"user_001",'
+                '"record_type":"ANALYTICS_PROFILE"}]}'
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_policy_records",), (), None, "UNKNOWN", ())
+                for resource_id in ("support_001", "support_002", "analytics_001")
+            ],
+            EvidenceIndex([evidence]),
+        )
+        case = AuditCase(
+            "case_policy_records",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        rules = [
+            DeletionRule("rule_support", "SUPPORT_MESSAGE", "Shared context", "REDACT"),
+            DeletionRule("rule_analytics", "ANALYTICS_PROFILE", "Still attributable", "ANONYMIZE"),
+        ]
+
+        self.assertEqual(["PRESENT", "REDACTED", "PRESENT"], [
+            resource.observed_state for resource in resources
+        ])
+        support_redacted = plan_investigation(
+            case,
+            CaseInvestigation(
+                "case_policy_records", ("evidence_policy_records",), (resources[1],)
+            ),
+            rules,
+        )
+        analytics_identifiable = plan_investigation(
+            case,
+            CaseInvestigation(
+                "case_policy_records", ("evidence_policy_records",), (resources[2],)
+            ),
+            rules,
+        )
+        self.assertEqual("COMPLETE", support_redacted.deletion_status)
+        self.assertEqual("VERIFY_RECORD_REDACTED", support_redacted.steps[0]["operation"])
+        self.assertEqual("INCOMPLETE", analytics_identifiable.deletion_status)
+        self.assertEqual("ANONYMIZE_RECORD", analytics_identifiable.steps[1]["operation"])
+
+    def test_policy_retention_requires_a_known_cutoff_and_active_legal_hold(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_retention",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        evidence = EvidenceFile(
+            "evidence_retention",
+            Path("retention.json"),
+            "test_fixture",
+            audit_at,
+            '{"resource_id":"audit_record_001","subject_reference":"user_001",'
+            '"event_name":"ACCOUNT_DELETION_RECORDED",'
+            '"retention_until":"2030-12-31T23:59:59Z"}',
+        )
+        resources = reconstruct_resource_states(
+            [ResourceObservation("audit_record_001", ("evidence_retention",), (), None, "UNKNOWN", ())],
+            EvidenceIndex([evidence]),
+        )
+        result = plan_investigation(
+            case,
+            CaseInvestigation("case_retention", ("evidence_retention",), resources),
+            [DeletionRule("rule_audit", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN")],
+        )
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual("VERIFY_RECORD_PRESENT", result.steps[0]["operation"])
+
+        expired_retention = ResourceObservation(
+            "audit_record_003",
+            ("evidence_retention",),
+            (),
+            None,
+            "PRESENT",
+            ("evidence_retention",),
+            datetime(2025, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        expired_result = plan_investigation(
+            case,
+            CaseInvestigation("case_retention", ("evidence_retention",), (expired_retention,)),
+            [DeletionRule("rule_audit", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN")],
+        )
+        self.assertEqual("INCOMPLETE", expired_result.deletion_status)
+        self.assertEqual("DELETE_RECORD", expired_result.steps[1]["operation"])
+
+        no_cutoff = ResourceObservation(
+            "audit_record_002", ("evidence_retention",), (), None, "PRESENT", ("evidence_retention",)
+        )
+        with self.assertRaisesRegex(ContractError, "retention cutoff is unknown"):
+            plan_investigation(
+                case,
+                CaseInvestigation("case_retention", ("evidence_retention",), (no_cutoff,)),
+                [DeletionRule("rule_audit", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN")],
+            )
+
+    def test_blocked_backup_is_verified_as_retained_and_not_recommended_for_deletion(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_backup",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        observation = ResourceObservation(
+            "backup_001", ("evidence_backup",), (), None, "BLOCKED", ("evidence_backup",)
+        )
+
+        result = plan_investigation(
+            case,
+            CaseInvestigation("case_backup", ("evidence_backup",), (observation,)),
+            [DeletionRule("rule_backup", "BACKUP_ARCHIVE", "Restore can be blocked", "RETAIN")],
+        )
+
+        self.assertEqual("COMPLETE", result.deletion_status)
+        self.assertEqual("VERIFY_RESTORE_BLOCKED", result.steps[0]["operation"])
+
+    def test_active_legal_hold_is_retained_and_unknown_hold_status_blocks_completion(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_hold",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        evidence = EvidenceFile(
+            "evidence_hold",
+            Path("hold.json"),
+            "test_fixture",
+            audit_at,
+            '{"resource_id":"legal_hold_001","subject_reference":"user_001",'
+            '"record_type":"LEGAL_HOLD_RECORD","hold_status":"ACTIVE"}',
+        )
+        resources = reconstruct_resource_states(
+            [ResourceObservation("legal_hold_001", ("evidence_hold",), (), None, "UNKNOWN", ())],
+            EvidenceIndex([evidence]),
+        )
+        rules = [
+            DeletionRule("rule_hold", "LEGAL_HOLD_RECORD", "Active hold", "RETAIN")
+        ]
+        result = plan_investigation(
+            case,
+            CaseInvestigation("case_hold", ("evidence_hold",), resources),
+            rules,
+        )
+        self.assertTrue(resources[0].policy_active)
+        self.assertEqual("VERIFY_RECORD_PRESENT", result.steps[0]["operation"])
+
+        unknown_hold = EvidenceFile(
+            "evidence_hold_unknown",
+            Path("hold_unknown.json"),
+            "test_fixture",
+            audit_at,
+            '{"resource_id":"legal_hold_002","subject_reference":"user_001",'
+            '"record_type":"LEGAL_HOLD_RECORD","result":"FOUND"}',
+        )
+        unknown_resources = reconstruct_resource_states(
+            [
+                ResourceObservation(
+                    "legal_hold_002", ("evidence_hold_unknown",), (), None, "UNKNOWN", ()
+                )
+            ],
+            EvidenceIndex([unknown_hold]),
+        )
+        with self.assertRaisesRegex(ContractError, "legal-hold status is unknown"):
+            plan_investigation(
+                case,
+                CaseInvestigation("case_hold", ("evidence_hold_unknown",), unknown_resources),
+                rules,
+            )
 
     def test_plans_ordered_policy_actions_for_evidence_proven_record(self):
         case = next(item for item in load_requests(DATASET / "sample_deletion_requests.csv") if item.case_id == "case_05")

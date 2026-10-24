@@ -12,7 +12,7 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 Request intent is determined with deterministic multilingual rules. The classifier recognizes deletion and deletion-audit wording while excluding requests for access, correction, export, marketing opt-out, and explicit instructions not to delete.
 
-Single-case orchestration infers resource states only from linked evidence with explicit state signals. Unresolved or conflicting evidence does not establish `COMPLETE`; full completion evaluation and dataset output generation are not implemented yet.
+Single-case orchestration infers resource states only from linked evidence, applies the supplied delete/redact/anonymize/retain rules, and emits evidence-backed verification for discovered resources that meet policy. Tombstones are correlated by their stable `user_id`; retention cutoffs, active legal holds, and blocked backup restores are checked explicitly. Unknown state or policy conditions prevent a completion decision. This evaluator does not establish that evidence discovery is globally exhaustive, and batch processing/output generation are not implemented yet.
 
 ---
 
