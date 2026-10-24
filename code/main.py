@@ -392,7 +392,7 @@ def _resource_state_from_result(result: str, resource_id: str) -> str:
 
 
 def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: bool = False) -> str:
-    normalized = text.casefold()
+    normalized = text.replace('\\"', '"').casefold()
     if resource_id.startswith("data_flow_"):
         if re.search(
             r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
@@ -426,8 +426,21 @@ def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: boo
     result = re.search(r"\bresult\s*[=:]\s*[\"']?([a-z_]+)", normalized)
     if result and _resource_state_from_result(result.group(1), resource_id) == "ABSENT":
         return "ABSENT"
-    if re.search(r"\brows\s*=\s*0\b|\bhttp_status\s*=\s*404\b", normalized):
+    if re.search(
+        r"\brows\s*=\s*[\"']?0[\"']?\b|\bhttp_status\s*=\s*[\"']?404[\"']?\b",
+        normalized,
+    ):
         return "ABSENT"
+    if (
+        resource_id.startswith("support_")
+        and re.search(r"\bmessage_text\s*[=:]\s*[\"']\[redacted\][\"']", normalized)
+    ):
+        return "REDACTED"
+    if (
+        resource_id.startswith("export_")
+        and re.search(r"\b(?:available|download_available)\s*=\s*[\"']?true\b", normalized)
+    ):
+        return "PRESENT"
     if not resource_id.startswith(("data_flow_", "backup_")) and _text_has_direct_identifier(normalized):
         return "PRESENT"
     if result:
@@ -436,7 +449,10 @@ def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: boo
             resource_id.startswith("tombstone_") and state == "REDACTED"
         ):
             return state
-    if re.search(r"\brows\s*=\s*[1-9]\d*\b|\bhttp_status\s*=\s*2\d\d\b", normalized):
+    if re.search(
+        r"\brows\s*=\s*[\"']?[1-9]\d*[\"']?\b|\bhttp_status\s*=\s*[\"']?2\d\d[\"']?\b",
+        normalized,
+    ):
         return "PRESENT"
     if resource_id.startswith("tombstone_"):
         stable_reference = re.search(
@@ -664,6 +680,10 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
             return "RESTORABLE"
         if restore_allowed is False or isinstance(restore_allowed, str) and restore_allowed.casefold() in {"false", "0"}:
             return "BLOCKED"
+    if resource_id.startswith("export_"):
+        available = record.get("available", record.get("download_available"))
+        if available is True or isinstance(available, str) and available.casefold() == "true":
+            return "PRESENT"
     if record.get("status_code") == 404:
         return "ABSENT"
     if has_identifier(record):

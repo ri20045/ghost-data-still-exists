@@ -669,7 +669,9 @@ class ContractTests(unittest.TestCase):
                 '2026-01-03T00:00:03Z {"resource_id":"data_flow_001",'
                 '"enabled":"true","scheduler_registered":"true"}\n'
                 '2026-01-03T00:00:04Z {"resource_id":"backup_001",'
-                '"restore_allowed":"false"}'
+                '"restore_allowed":"false"}\n'
+                '2026-01-03T00:00:05Z {"resource_id":"export_001",'
+                '"available":"true"}'
             ),
         )
         resource_ids = (
@@ -678,6 +680,7 @@ class ContractTests(unittest.TestCase):
             "support_001",
             "data_flow_001",
             "backup_001",
+            "export_001",
         )
         resources = reconstruct_resource_states(
             [
@@ -688,7 +691,45 @@ class ContractTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["PRESENT", "PRESENT", "REDACTED", "ACTIVE", "BLOCKED"],
+            ["PRESENT", "PRESENT", "REDACTED", "ACTIVE", "BLOCKED", "PRESENT"],
+            [resource.observed_state for resource in resources],
+        )
+
+    def test_reconstructs_escaped_quoted_key_value_log_fields(self):
+        evidence = EvidenceFile(
+            "evidence_escaped_log",
+            Path("runtime.log"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            (
+                '2026-01-03T00:00:00Z message="resource_id=\\"account_001\\" '
+                'rows=\\"0\\" http_status=\\"404\\" correlation_key=\\"person@example.test\\""\n'
+                '2026-01-03T00:00:01Z message="resource_id=\\"data_flow_001\\" '
+                'enabled=\\"true\\" scheduler_registered=\\"true\\""\n'
+                '2026-01-03T00:00:02Z message="resource_id=\\"support_001\\" '
+                'message_text=\\"[REDACTED]\\""\n'
+                '2026-01-03T00:00:03Z message="resource_id=\\"search_001\\" '
+                'event=\\"index_query_completed\\" result=\\"hit\\""\n'
+                '2026-01-03T00:00:04Z message="resource_id=\\"export_001\\" '
+                'event=\\"export_download_check_completed\\" available=\\"true\\""'
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_escaped_log",), (), None, "UNKNOWN", ())
+                for resource_id in (
+                    "account_001",
+                    "data_flow_001",
+                    "support_001",
+                    "search_001",
+                    "export_001",
+                )
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["ABSENT", "ACTIVE", "REDACTED", "PRESENT", "PRESENT"],
             [resource.observed_state for resource in resources],
         )
 

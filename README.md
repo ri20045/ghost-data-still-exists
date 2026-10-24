@@ -18,6 +18,8 @@ Evidence-state reconstruction also reads nested JSON records and export-job fiel
 
 Timestamped log lines that contain a complete JSON object are also parsed as structured resource evidence. Explicit hit results, direct-identifier scan matches, redacted messages, and enabled/disabled flow or restore flags are recognized; absent or unparseable fields remain unknown.
 
+Quoted key-value log messages are normalized before state checks, including escaped quotes embedded in an outer message field. This allows explicit 404/zero-row lookups, search hits, redaction markers, active-flow flags, and available exports to be reconstructed without treating a missing field as evidence.
+
 For SQL snapshots that define `security_audit_records`, retention cutoffs are read from the `retention_until` column using that table's declared schema and matching resource row. Audit events from other tables or text that only reports an audit record as found do not establish a retention cutoff. The public sample's audit rows that omit this value therefore remain unresolved.
 
 The public sample has a source inconsistency: `sample_output.csv` cites `account_001` and `account_002` in `evidence_54` for its first two cases, but the participant-facing evidence file does not contain those resource IDs. The implementation does not use sample answers to fabricate evidence; clarify or correct this discrepancy before relying on full-dataset completion results.
