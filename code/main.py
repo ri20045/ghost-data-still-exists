@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,6 +36,23 @@ REQUIRED_REQUEST_COLUMNS = (
 OUTPUT_COLUMNS = ("case_id", "deletion_status", "steps_json")
 VALID_STATUSES = {"COMPLETE", "INCOMPLETE", "NOT_APPLICABLE"}
 PHASE_ORDER = {"FINDING": 0, "REMEDIATION": 1, "VERIFICATION": 2}
+OPERATION_ORDER = {
+    "REPORT_REMAINING_RECORD": 0,
+    "REPORT_EXPOSED_PII": 1,
+    "REPORT_ACTIVE_DATA_FLOW": 2,
+    "REPORT_RESTORE_RISK": 3,
+    "DISABLE_DATA_FLOW": 0,
+    "BLOCK_RESTORE": 1,
+    "DELETE_RECORD": 2,
+    "REDACT_RECORD": 3,
+    "ANONYMIZE_RECORD": 4,
+    "VERIFY_RECORD_ABSENT": 0,
+    "VERIFY_RECORD_PRESENT": 1,
+    "VERIFY_RECORD_REDACTED": 2,
+    "VERIFY_RECORD_ANONYMIZED": 3,
+    "VERIFY_DATA_FLOW_DISABLED": 4,
+    "VERIFY_RESTORE_BLOCKED": 5,
+}
 STEP_FIELDS = {
     "step_no",
     "phase",
@@ -59,6 +77,57 @@ TEXT_EVIDENCE_SUFFIXES = {".log", ".sql", ".txt"}
 RESOURCE_ID_PATTERN = re.compile(
     r"\b(?:account|analytics|audit_record|backup|data_flow|export|search|support|tombstone)_\d+\b"
 )
+DELETION_MARKERS = (
+    "delete", "deleted", "deleting", "deletion", "erase", "erased", "erasing", "erasure",
+    "remove my", "remove any", "remove all", "remove the account", "remove this account",
+    "remove records", "remove the profile", "remove profile", "remove the rest",
+    "remove that search result", "remove the search result", "remove personal",
+    "close my account", "close the account", "close this account", "closed my account",
+    "closed this account", "account deletion", "deletion request", "suppression", "supprimer",
+    "supresión", "eliminación", "eliminacion", "eliminar", "borrar", "exclusão", "exclusao",
+    "excluir", "apagamento", "apagar", "deletar", "삭제", "削除", "消去",
+)
+NEGATED_DELETION_PATTERNS = (
+    r"\bnot\s+(?:a\s+)?request\s+to\s+(?:delete|erase|remove|close)\b",
+    r"\bnot\s+(?:asking|requesting)\s+(?:for\s+(?:a\s+)?(?:deletion|erasure)|to\s+(?:delete|erase|remove|close))\b",
+    r"\b(?:do\s+not|don['’]t|never)\s+(?:delete|erase|remove|close)\b",
+    r"\b(?:do\s+not|don['’]t|never)\s+(?:want|need|wish)\s+(?:(?:you\s+)?to\s+)?(?:any\s+|a\s+)?(?:delete|erase|remove|close|deletion|erasure)\b",
+    r"\bwithout\s+(?:deleting|erasing|removing|closing)\b",
+    r"\bremove\s+me\s+from\s+(?:the\s+)?(?:marketing|promotional|mailing)\s+lists?\b",
+    r"\bnot\s+(?:a\s+)?(?:deletion|erasure)\s+request\b",
+    r"\bno\s+(?:solicito|pido|quiero)\s+(?:la\s+)?(?:eliminaci[oó]n|supresi[oó]n|borrar|eliminar)\b",
+    r"\b(?:n[aã]o\s+(?:estou\s+)?(?:pedindo|solicito)|n[aã]o\s+quero)\s+(?:a\s+)?(?:exclus[aã]o|elimina[cç][aã]o|apagar|excluir)\b",
+    r"\bpas\s+(?:une\s+demande\s+de|de\s+demande\s+de)\s+(?:suppression|effacement)\b",
+    r"\bne\s+demande\s+pas\s+(?:la\s+)?(?:suppression|effacement)\b",
+    r"\bne\s+(?:veux|souhaite)\s+pas\s+(?:supprimer|effacer)\b",
+    r"削除(?:を依頼していません|の依頼ではありません|しないで)",
+    r"削除(?:를 요청하지 않습니다| 요청이 아닙니다|하지 마세요)",
+)
+DELETION_AUDIT_ACTIONS = (
+    "check", "confirm", "verify", "audit", "inspect", "review", "investigate",
+    "tell me whether", "let me know whether",
+)
+DELETION_AUDIT_STATES = (
+    "gone", "removed", "deleted", "erased", "no longer exists", "does not exist",
+    "doesn't exist", "fully removed",
+)
+DELETION_AUDIT_SUBJECTS = ("account", "profile", "personal data", "analytics data", "records")
+PREFIX_TO_CATEGORY = {
+    "account": "USER_PROFILE",
+    "analytics": "ANALYTICS_PROFILE",
+    "audit_record": "SECURITY_AUDIT_LOG",
+    "backup": "BACKUP_ARCHIVE",
+    "data_flow": "DATA_FLOW",
+    "export": "USER_EXPORT",
+    "search": "SEARCH_INDEX_ENTRY",
+    "support": "SUPPORT_MESSAGE",
+    "tombstone": "ACCOUNT_TOMBSTONE",
+}
+PREFIX_TO_SYSTEM = {
+    "account": "account_service", "analytics": "analytics_platform", "audit_record": "security_service",
+    "backup": "backup_service", "data_flow": "integration_service", "export": "export_service",
+    "search": "search_service", "support": "support_platform", "tombstone": "identity_service",
+}
 
 
 class ContractError(ValueError):
@@ -254,6 +323,98 @@ def investigate_case(
         evidence_ids=tuple(item.file_id for item in evidence),
         resources=tuple(observations),
     )
+
+
+def request_authorizes_deletion(request_text: str) -> bool:
+    """Recognize deletion requests and deletion audits without treating denials as consent."""
+    normalized = unicodedata.normalize("NFKC", request_text).casefold()
+    for pattern in NEGATED_DELETION_PATTERNS:
+        normalized = re.sub(pattern, " ", normalized)
+
+    if any(marker in normalized for marker in DELETION_MARKERS):
+        return True
+    return (
+        any(action in normalized for action in DELETION_AUDIT_ACTIONS)
+        and any(state in normalized for state in DELETION_AUDIT_STATES)
+        and any(subject in normalized for subject in DELETION_AUDIT_SUBJECTS)
+    )
+
+
+def make_step(
+    phase: str, system_id: str, resource_id: str, operation: str, state: str, evidence_id: str
+) -> dict[str, Any]:
+    return {
+        "step_no": 0,
+        "phase": phase,
+        "system_id": system_id,
+        "resource_id": resource_id,
+        "operation": operation,
+        "state": state,
+        "evidence_id": evidence_id,
+    }
+
+
+def resource_prefix(resource_id: str) -> str:
+    if resource_id.startswith("audit_record_"):
+        return "audit_record"
+    if resource_id.startswith("data_flow_"):
+        return "data_flow"
+    return resource_id.split("_", 1)[0]
+
+
+def plan_investigation(
+    case: AuditCase, investigation: CaseInvestigation, rules: Iterable[DeletionRule]
+) -> OutputRow:
+    """Build a conservative, deterministic plan from evidence-proven present resources."""
+    if not request_authorizes_deletion(case.request_text):
+        return OutputRow(case.case_id, "NOT_APPLICABLE", [])
+
+    action_by_category = {rule.data_category: rule.required_action for rule in rules}
+    steps: list[dict[str, Any]] = []
+    for observation in investigation.resources:
+        prefix = resource_prefix(observation.resource_id)
+        category = PREFIX_TO_CATEGORY[prefix]
+        system_id = PREFIX_TO_SYSTEM[prefix]
+        evidence_id = observation.evidence_ids[0]
+        action = action_by_category.get(category)
+        if prefix == "data_flow":
+            steps.extend((
+                make_step("FINDING", system_id, observation.resource_id, "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", evidence_id),
+                make_step("REMEDIATION", system_id, observation.resource_id, "DISABLE_DATA_FLOW", "DISABLED", ""),
+                make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_DATA_FLOW_DISABLED", "DISABLED", ""),
+            ))
+        elif prefix == "backup":
+            steps.extend((
+                make_step("FINDING", system_id, observation.resource_id, "REPORT_RESTORE_RISK", "ACTIVE", evidence_id),
+                make_step("REMEDIATION", system_id, observation.resource_id, "BLOCK_RESTORE", "BLOCKED", ""),
+                make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""),
+            ))
+        elif action == "DELETE":
+            steps.extend((
+                make_step("FINDING", system_id, observation.resource_id, "REPORT_REMAINING_RECORD", "PRESENT", evidence_id),
+                make_step("REMEDIATION", system_id, observation.resource_id, "DELETE_RECORD", "ABSENT", ""),
+                make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_RECORD_ABSENT", "ABSENT", ""),
+            ))
+        elif action in {"REDACT", "ANONYMIZE"}:
+            operation = "REDACT_RECORD" if action == "REDACT" else "ANONYMIZE_RECORD"
+            state = "REDACTED" if action == "REDACT" else "ANONYMIZED"
+            verify = "VERIFY_RECORD_REDACTED" if action == "REDACT" else "VERIFY_RECORD_ANONYMIZED"
+            steps.extend((
+                make_step("FINDING", system_id, observation.resource_id, "REPORT_EXPOSED_PII", "PRESENT", evidence_id),
+                make_step("REMEDIATION", system_id, observation.resource_id, operation, state, ""),
+                make_step("VERIFICATION", system_id, observation.resource_id, verify, state, ""),
+            ))
+
+    if not steps:
+        raise ContractError(
+            f"{case.case_id}: no evidence-backed resource state is available to prove completion or plan remediation"
+        )
+    steps.sort(key=lambda step: (
+        PHASE_ORDER[step["phase"]], OPERATION_ORDER[step["operation"]], step["system_id"], step["resource_id"]
+    ))
+    for step_no, step in enumerate(steps, start=1):
+        step["step_no"] = step_no
+    return OutputRow(case.case_id, "INCOMPLETE", steps)
 
 
 class IdentityResolver:
@@ -550,11 +711,12 @@ def main() -> int:
     parser.add_argument("--resolve-case", metavar="CASE_ID", help="print a case's stable user ID and alias counts")
     parser.add_argument("--inspect-evidence", metavar="CASE_ID", help="count text evidence linked to a resolved case at audit_at")
     parser.add_argument("--investigate-case", metavar="CASE_ID", help="list evidence-grounded resource candidates and activity claims")
+    parser.add_argument("--plan-case", metavar="CASE_ID", help="build a policy-based plan for an investigated case")
     args = parser.parse_args()
 
     try:
         cases = load_requests(args.requests)
-        selected_case_id = args.resolve_case or args.inspect_evidence or args.investigate_case
+        selected_case_id = args.resolve_case or args.inspect_evidence or args.investigate_case or args.plan_case
         if selected_case_id:
             case = next((item for item in cases if item.case_id == selected_case_id), None)
             if case is None:
@@ -578,6 +740,15 @@ def main() -> int:
                     f"Investigated {case.case_id}: {len(investigation.evidence_ids)} evidence item(s), "
                     f"{len(investigation.resources)} evidence-grounded resource candidate(s)."
                 )
+            if args.plan_case:
+                investigation = investigate_case(
+                    case,
+                    identity,
+                    load_evidence_index(DATASET_ROOT / "evidence_files.csv"),
+                    load_activity_index(DATASET_ROOT / "system_activity.csv"),
+                )
+                plan = plan_investigation(case, investigation, load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"))
+                print(f"Planned {plan.case_id}: {plan.deletion_status} with {len(plan.steps)} ordered step(s).")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

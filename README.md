@@ -10,6 +10,8 @@ For each request, the agent must first determine whether deletion was actually r
 
 Read [`problem_statement.md`](./problem_statement.md) for the complete challenge contract.
 
+Request intent is determined with deterministic multilingual rules. The classifier recognizes deletion and deletion-audit wording while excluding requests for access, correction, export, marketing opt-out, and explicit instructions not to delete.
+
 ---
 
 ## Quick Start
@@ -46,6 +48,7 @@ python3 code/main.py --validate-output output.csv
 python3 code/main.py --requests dataset/sample_deletion_requests.csv --compare-sample path/to/sample_prediction.csv
 python3 code/main.py --inspect-evidence case_33
 python3 code/main.py --investigate-case case_05
+python3 code/main.py --plan-case case_05
 python3 -m unittest discover -s code -p 'test_*.py'
 ```
 
