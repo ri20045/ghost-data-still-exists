@@ -970,6 +970,65 @@ class ContractTests(unittest.TestCase):
                 [DeletionRule("rule_audit", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN")],
             )
 
+    def test_reconstructs_retention_cutoff_from_sql_table_schema(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_sql_retention",
+            Path("inventory.sql"),
+            "test_fixture",
+            audit_at,
+            (
+                "CREATE TABLE security_audit_records ("
+                "resource_id TEXT PRIMARY KEY, subject_reference TEXT NOT NULL, "
+                "event_code TEXT NOT NULL, retention_until TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL);\n"
+                "INSERT INTO security_audit_records VALUES "
+                "('audit_record_001', 'user_001', 'ACCOUNT_DELETION_RECORDED', "
+                "'2030-12-31T23:59:59Z', '2026-01-02T00:00:00Z');\n"
+                "INSERT INTO security_audit_records VALUES "
+                "('audit_record_002', 'user_002', 'ACCOUNT_DELETION_RECORDED', "
+                "NULL, '2026-01-02T00:00:00Z');"
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_sql_retention",), (), None, "UNKNOWN", ())
+                for resource_id in ("audit_record_001", "audit_record_002")
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            datetime(2030, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            resources[0].retention_until,
+        )
+        self.assertEqual("PRESENT", resources[0].observed_state)
+        self.assertIsNone(resources[1].retention_until)
+        self.assertEqual("PRESENT", resources[1].observed_state)
+
+        case = AuditCase(
+            "case_sql_retention",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        rules = [DeletionRule("rule_audit", "SECURITY_AUDIT_LOG", "Within retention", "RETAIN")]
+        complete = plan_investigation(
+            case,
+            CaseInvestigation("case_sql_retention", ("evidence_sql_retention",), (resources[0],)),
+            rules,
+        )
+        self.assertEqual("COMPLETE", complete.deletion_status)
+        with self.assertRaisesRegex(ContractError, "retention cutoff is unknown"):
+            plan_investigation(
+                case,
+                CaseInvestigation("case_sql_retention", ("evidence_sql_retention",), (resources[1],)),
+                rules,
+            )
+
     def test_blocked_backup_is_verified_as_retained_and_not_recommended_for_deletion(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         case = AuditCase(

@@ -774,6 +774,59 @@ def _policy_metadata_from_text(text: str, resource_id: str) -> tuple[datetime | 
     return retention_until, policy_active
 
 
+def _policy_metadata_from_sql(text: str, resource_id: str) -> list[datetime]:
+    table_name = "security_audit_records"
+    table_definition = re.search(
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"`\[]?{table_name}[\"`\]]?"
+        r"\s*\((.*?)\)\s*;",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not table_definition:
+        return []
+
+    columns: list[str] = []
+    for definition in table_definition.group(1).split(","):
+        column = re.match(r'\s*(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))', definition)
+        if column:
+            columns.append(next(value for value in column.groups() if value is not None))
+    if not {"resource_id", "retention_until"}.issubset(columns):
+        return []
+
+    metadata = []
+    for line in text.splitlines():
+        insert = re.search(
+            rf"\bINSERT\s+INTO\s+[\"`\[]?{table_name}[\"`\]]?"
+            r"\s*(?:\(([^)]*)\))?\s+VALUES\s*\(",
+            line,
+            re.IGNORECASE,
+        )
+        if not insert:
+            continue
+        insert_columns = (
+            [column.strip().strip('"`[]') for column in insert.group(1).split(",")]
+            if insert.group(1)
+            else columns
+        )
+        values = _sql_values_from_line(line)
+        if values is None or len(insert_columns) != len(values):
+            continue
+        row = dict(zip(insert_columns, values))
+        retention_value = row.get("retention_until", "").strip()
+        if (
+            row.get("resource_id") != resource_id
+            or retention_value.casefold() in {"", "null", "none"}
+        ):
+            continue
+        retention_until = parse_timestamp(
+            retention_value,
+            field_name="retention_until",
+            case_id=resource_id,
+        )
+        metadata.append(retention_until)
+    return metadata
+
+
 def reconstruct_resource_states(
     resources: Iterable[ResourceObservation], evidence_index: EvidenceIndex
 ) -> tuple[ResourceObservation, ...]:
@@ -833,6 +886,13 @@ def reconstruct_resource_states(
                     )
                     if retention_until is not None or policy_active is not None:
                         metadata.append((evidence.captured_at, retention_until, policy_active))
+            if evidence.path.suffix.casefold() == ".sql":
+                metadata.extend(
+                    (evidence.captured_at, retention_until, None)
+                    for retention_until in _policy_metadata_from_sql(
+                        evidence.text, resource.resource_id
+                    )
+                )
         latest_metadata_at = max((item[0] for item in metadata), default=None)
         latest_metadata = [
             item for item in metadata

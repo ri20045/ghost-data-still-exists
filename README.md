@@ -16,6 +16,8 @@ Single-case orchestration correlates resources through direct identity matches a
 
 Evidence-state reconstruction also reads nested JSON records and export-job fields, including explicit profile lookup status codes, and recognizes the status column in pipe-delimited inventory records. These formats are interpreted conservatively: identity-linked activity remains a discovery lead, and missing or conflicting state evidence is not treated as proof of deletion.
 
+For SQL snapshots that define `security_audit_records`, retention cutoffs are read from the `retention_until` column using that table's declared schema and matching resource row. Audit events from other tables or text that only reports an audit record as found do not establish a retention cutoff. The public sample's audit rows that omit this value therefore remain unresolved.
+
 The public sample has a source inconsistency: `sample_output.csv` cites `account_001` and `account_002` in `evidence_54` for its first two cases, but the participant-facing evidence file does not contain those resource IDs. The implementation does not use sample answers to fabricate evidence; clarify or correct this discrepancy before relying on full-dataset completion results.
 
 ---
