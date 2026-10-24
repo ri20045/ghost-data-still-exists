@@ -163,6 +163,9 @@ class CaseCoverageDiagnostic:
     case_id: str
     outcome: str
     reason: str = ""
+    reason_code: str = ""
+    resource_id: str = ""
+    evidence_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1008,23 +1011,23 @@ def orchestrate_case(
     return plan_investigation(case, investigation, rules)
 
 
-def _missing_evidence_reason(error: ContractError) -> str | None:
+def _missing_evidence_reason(error: ContractError) -> tuple[str, str] | None:
     message = str(error)
     normalized = message.casefold()
     if "no identity found for request email" in normalized:
-        return "no matching participant-facing identity record"
+        return "NO_IDENTITY", "no matching participant-facing identity record"
     if "no evidence-backed resources establish" in normalized:
-        return "no linked evidence establishes a resource state"
+        return "NO_LINKED_RESOURCE", "no linked evidence establishes a resource state"
     if "has no evidence for its reconstructed state" in normalized:
-        return "resource state has no supporting evidence"
+        return "NO_STATE_EVIDENCE", message.split(": ", 1)[-1]
     if "retention cutoff is unknown" in normalized:
-        return message.split(": ", 1)[-1]
+        return "UNKNOWN_RETENTION_CUTOFF", message.split(": ", 1)[-1]
     if "legal-hold status is unknown" in normalized:
-        return message.split(": ", 1)[-1]
+        return "UNKNOWN_LEGAL_HOLD", message.split(": ", 1)[-1]
     if "not evidenced as present" in normalized:
-        return message.split(": ", 1)[-1]
+        return "REQUIRED_RECORD_NOT_EVIDENCED", message.split(": ", 1)[-1]
     if "state is unknown" in normalized:
-        return message.split(": ", 1)[-1]
+        return "UNKNOWN_RESOURCE_STATE", message.split(": ", 1)[-1]
     return None
 
 
@@ -1044,16 +1047,40 @@ def diagnose_case_coverage(
                 case, identity_resolver, evidence_index, activity_index, rules_list
             )
         except ContractError as error:
-            reason = _missing_evidence_reason(error)
-            if reason is not None:
+            blocked_reason = _missing_evidence_reason(error)
+            if blocked_reason is not None:
                 outcome = "BLOCKED"
+                reason_code, reason = blocked_reason
             elif "maps to multiple users" in str(error).casefold():
                 outcome = "ERROR"
                 reason = "request identifier maps to multiple identity records"
+                reason_code = "AMBIGUOUS_IDENTITY"
             else:
                 outcome = "ERROR"
                 reason = str(error)
-            diagnostics.append(CaseCoverageDiagnostic(case.case_id, outcome, reason))
+                reason_code = "PROCESSING_ERROR"
+            resource_match = RESOURCE_ID_PATTERN.search(str(error))
+            resource_id = resource_match.group(0) if resource_match else ""
+            evidence_ids = (
+                tuple(
+                    sorted({
+                        evidence.file_id
+                        for evidence in evidence_index.for_resource(resource_id, case.audit_at)
+                    })
+                )
+                if resource_id
+                else ()
+            )
+            diagnostics.append(
+                CaseCoverageDiagnostic(
+                    case.case_id,
+                    outcome,
+                    reason,
+                    reason_code,
+                    resource_id,
+                    evidence_ids,
+                )
+            )
         else:
             diagnostics.append(
                 CaseCoverageDiagnostic(case.case_id, result.deletion_status)
@@ -1693,11 +1720,21 @@ def main() -> int:
             for outcome, count in counts.items():
                 print(f"  {outcome}: {count}")
             for outcome in ("BLOCKED", "ERROR"):
-                entries = [item for item in diagnostics if item.outcome == outcome]
-                if entries:
-                    print(f"{outcome} cases:")
+                groups: dict[str, list[CaseCoverageDiagnostic]] = defaultdict(list)
+                for item in diagnostics:
+                    if item.outcome == outcome:
+                        groups[item.reason_code].append(item)
+                for reason_code, entries in sorted(groups.items()):
+                    print(f"{outcome} {reason_code} ({len(entries)} case(s)):")
                     for item in entries:
-                        print(f"  {item.case_id}: {item.reason}")
+                        resources = f" resource={item.resource_id}" if item.resource_id else ""
+                        evidence = (
+                            ",".join(item.evidence_ids) if item.evidence_ids else "none"
+                        )
+                        print(
+                            f"  {item.case_id}:{resources} evidence={evidence} "
+                            f"reason={item.reason}"
+                        )
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

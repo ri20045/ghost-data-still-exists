@@ -57,19 +57,38 @@ class ContractTests(unittest.TestCase):
             ContractError("case_3: no deletion rule for category USER_PROFILE"),
             OutputRow("case_4", "NOT_APPLICABLE", []),
         )
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_retention_row",
+                    Path("audit.sql"),
+                    "test_fixture",
+                    audit_at,
+                    "resource_id=audit_record_002",
+                )
+            ]
+        )
         with patch("main.orchestrate_case", side_effect=expected):
             diagnostics = diagnose_case_coverage(
-                cases, Mock(), EvidenceIndex([]), ActivityIndex([]), []
+                cases, Mock(), evidence_index, ActivityIndex([]), []
             )
 
         self.assertEqual(
             (
                 CaseCoverageDiagnostic("case_1", "COMPLETE"),
                 CaseCoverageDiagnostic(
-                    "case_2", "BLOCKED", "retention cutoff is unknown for audit_record_002"
+                    "case_2",
+                    "BLOCKED",
+                    "retention cutoff is unknown for audit_record_002",
+                    "UNKNOWN_RETENTION_CUTOFF",
+                    "audit_record_002",
+                    ("evidence_retention_row",),
                 ),
                 CaseCoverageDiagnostic(
-                    "case_3", "ERROR", "case_3: no deletion rule for category USER_PROFILE"
+                    "case_3",
+                    "ERROR",
+                    "case_3: no deletion rule for category USER_PROFILE",
+                    "PROCESSING_ERROR",
                 ),
                 CaseCoverageDiagnostic("case_4", "NOT_APPLICABLE"),
             ),
