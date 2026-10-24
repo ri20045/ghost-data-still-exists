@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -45,6 +46,8 @@ STEP_FIELDS = {
 IDENTITY_COLUMNS = ("user_id", "name", "email", "phone", "email_hash", "updated_at")
 AUDIT_COLUMNS = ("audit_id", "user_id", "event_time", "field_name", "old_value", "new_value")
 IDENTITY_FIELDS = ("name", "email", "phone", "email_hash")
+EVIDENCE_COLUMNS = ("file_id", "file_path", "origin", "captured_at")
+TEXT_EVIDENCE_SUFFIXES = {".log", ".sql", ".txt"}
 
 
 class ContractError(ValueError):
@@ -96,6 +99,34 @@ class ResolvedIdentity:
         for aliases in self.historical_values.values():
             values.update(aliases)
         return tuple(sorted(value for value in values if value))
+
+
+@dataclass(frozen=True)
+class EvidenceFile:
+    file_id: str
+    path: Path
+    origin: str
+    captured_at: datetime
+    text: str
+
+
+class EvidenceIndex:
+    """Searchable evidence whose contents, not manifest rows, establish case links."""
+
+    def __init__(self, files: list[EvidenceFile]):
+        self.files = tuple(sorted(files, key=lambda item: (item.captured_at, item.file_id)))
+
+    def search(self, identifiers: Iterable[str], audit_at: datetime) -> list[EvidenceFile]:
+        needles = {value.casefold() for value in identifiers if value.strip()}
+        if not needles:
+            return []
+        return [
+            evidence
+            for evidence in self.files
+            if evidence.captured_at <= audit_at
+            and evidence.text
+            and any(needle in evidence.text.casefold() for needle in needles)
+        ]
 
 
 class IdentityResolver:
@@ -219,6 +250,66 @@ def load_identity_resolver(identities_path: Path, audit_log_path: Path) -> Ident
     return IdentityResolver(snapshots, dict(changes))
 
 
+def extract_evidence_text(path: Path) -> str:
+    """Extract deterministic searchable text; image interpretation remains a later feature."""
+    suffix = path.suffix.casefold()
+    if suffix in TEXT_EVIDENCE_SUFFIXES:
+        return path.read_text(encoding="utf-8", errors="replace")
+    if suffix == ".json":
+        try:
+            return json.dumps(json.loads(path.read_text(encoding="utf-8")), ensure_ascii=False, sort_keys=True)
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{path}: invalid JSON evidence") from error
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            # Keep this dependency-free for clean challenge runs.  PDFs with compressed
+            # streams may yield no strings and are then deferred for visual analysis.
+            return subprocess.run(
+                ["strings", "-a", str(path)], check=True, text=True, capture_output=True
+            ).stdout
+        else:
+            try:
+                return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+            except Exception as error:  # pypdf exposes several format-specific exception classes.
+                raise ContractError(f"{path}: unable to extract PDF text") from error
+    if suffix == ".png":
+        # PNGs need visual/OCR interpretation, deliberately deferred to the evidence-state feature.
+        return ""
+    raise ContractError(f"{path}: unsupported evidence type {suffix!r}")
+
+
+def load_evidence_index(manifest_path: Path, dataset_root: Path = DATASET_ROOT) -> EvidenceIndex:
+    """Load only manifest-declared evidence and verify every path stays within dataset/evidence."""
+    evidence_root = (dataset_root / "evidence").resolve()
+    files: list[EvidenceFile] = []
+    with manifest_path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != EVIDENCE_COLUMNS:
+            raise ContractError(f"{manifest_path}: expected evidence columns {EVIDENCE_COLUMNS}")
+        file_ids: set[str] = set()
+        for row_number, row in enumerate(reader, start=2):
+            file_id = row["file_id"].strip()
+            relative_path = Path(row["file_path"])
+            resolved_path = (dataset_root / relative_path).resolve()
+            if not file_id or file_id in file_ids:
+                raise ContractError(f"{manifest_path}:{row_number}: missing or duplicate file_id")
+            if evidence_root not in resolved_path.parents or not resolved_path.is_file():
+                raise ContractError(f"{manifest_path}:{row_number}: invalid evidence path")
+            file_ids.add(file_id)
+            files.append(
+                EvidenceFile(
+                    file_id=file_id,
+                    path=resolved_path,
+                    origin=row["origin"].strip(),
+                    captured_at=parse_timestamp(row["captured_at"], field_name="captured_at", case_id=file_id),
+                    text=extract_evidence_text(resolved_path),
+                )
+            )
+    return EvidenceIndex(files)
+
+
 def validate_steps(status: str, steps: list[dict[str, Any]], *, case_id: str) -> None:
     if status == "NOT_APPLICABLE":
         if steps:
@@ -292,18 +383,24 @@ def main() -> int:
     parser.add_argument("--validate-output", type=Path, metavar="PATH")
     parser.add_argument("--compare-sample", type=Path, metavar="PATH", help="compare PATH with dataset/sample_output.csv")
     parser.add_argument("--resolve-case", metavar="CASE_ID", help="print a case's stable user ID and alias counts")
+    parser.add_argument("--inspect-evidence", metavar="CASE_ID", help="count text evidence linked to a resolved case at audit_at")
     args = parser.parse_args()
 
     try:
         cases = load_requests(args.requests)
-        if args.resolve_case:
-            case = next((item for item in cases if item.case_id == args.resolve_case), None)
+        selected_case_id = args.resolve_case or args.inspect_evidence
+        if selected_case_id:
+            case = next((item for item in cases if item.case_id == selected_case_id), None)
             if case is None:
-                raise ContractError(f"case not found: {args.resolve_case}")
+                raise ContractError(f"case not found: {selected_case_id}")
             resolver = load_identity_resolver(DATASET_ROOT / "user_identities.csv", DATASET_ROOT / "user_audit_log.csv")
             identity = resolver.resolve(case.email, case.audit_at)
-            alias_count = sum(len(values) for values in identity.historical_values.values())
-            print(f"Resolved {case.case_id} to {identity.user_id} with {alias_count} identifier values at or before audit_at.")
+            if args.resolve_case:
+                alias_count = sum(len(values) for values in identity.historical_values.values())
+                print(f"Resolved {case.case_id} to {identity.user_id} with {alias_count} identifier values at or before audit_at.")
+            if args.inspect_evidence:
+                matches = load_evidence_index(DATASET_ROOT / "evidence_files.csv").search(identity.all_identifiers, case.audit_at)
+                print(f"Found {len(matches)} text-evidence item(s) for {case.case_id} at or before audit_at.")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

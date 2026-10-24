@@ -44,6 +44,7 @@ sample prediction with the provided sample answer:
 ```bash
 python3 code/main.py --validate-output output.csv
 python3 code/main.py --requests dataset/sample_deletion_requests.csv --compare-sample path/to/sample_prediction.csv
+python3 code/main.py --inspect-evidence case_33
 python3 -m unittest discover -s code -p 'test_*.py'
 ```
 

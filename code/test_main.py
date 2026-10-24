@@ -1,11 +1,10 @@
-import shutil
-import tempfile
 import unittest
 from pathlib import Path
 
 from main import (
     ContractError,
     OutputRow,
+    load_evidence_index,
     load_identity_resolver,
     load_requests,
     validate_output_rows,
@@ -58,6 +57,23 @@ class ContractTests(unittest.TestCase):
         case = next(item for item in cases if item.case_id == "case_10")
         identity = resolver.resolve(case.email, case.audit_at)
         self.assertIn(case.email, identity.historical_values["email"])
+
+    def test_indexes_all_manifest_evidence_and_honors_audit_cutoff(self):
+        index = load_evidence_index(DATASET / "evidence_files.csv")
+        self.assertEqual(94, len(index.files))
+        earliest_capture = min(item.captured_at for item in index.files)
+        self.assertEqual([], index.search(["user_01"], earliest_capture.replace(year=2020)))
+
+    def test_evidence_search_uses_identity_values_not_manifest_metadata(self):
+        resolver = load_identity_resolver(
+            DATASET / "user_identities.csv", DATASET / "user_audit_log.csv"
+        )
+        case = load_requests(DATASET / "sample_deletion_requests.csv")[0]
+        identity = resolver.resolve(case.email, case.audit_at)
+        matches = load_evidence_index(DATASET / "evidence_files.csv").search(
+            identity.all_identifiers, case.audit_at
+        )
+        self.assertTrue(all(item.captured_at <= case.audit_at for item in matches))
 
 
 if __name__ == "__main__":
