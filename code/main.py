@@ -340,6 +340,22 @@ def request_authorizes_deletion(request_text: str) -> bool:
     )
 
 
+def orchestrate_case(
+    case: AuditCase,
+    identity_resolver: IdentityResolver,
+    evidence_index: EvidenceIndex,
+    activity_index: ActivityIndex,
+    rules: Iterable[DeletionRule],
+) -> OutputRow:
+    """Build one case result from intent, resolved identity, evidence, and policy."""
+    if not request_authorizes_deletion(case.request_text):
+        return OutputRow(case.case_id, "NOT_APPLICABLE", [])
+
+    identity = identity_resolver.resolve(case.email, case.audit_at)
+    investigation = investigate_case(case, identity, evidence_index, activity_index)
+    return plan_investigation(case, investigation, rules)
+
+
 def make_step(
     phase: str, system_id: str, resource_id: str, operation: str, state: str, evidence_id: str
 ) -> dict[str, Any]:

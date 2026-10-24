@@ -1,15 +1,24 @@
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 from main import (
+    ActivityIndex,
+    AuditCase,
     ContractError,
+    DeletionRule,
+    EvidenceFile,
+    EvidenceIndex,
     OutputRow,
+    ResolvedIdentity,
     load_evidence_index,
     load_activity_index,
     load_deletion_rules,
     load_identity_resolver,
     load_requests,
     investigate_case,
+    orchestrate_case,
     plan_investigation,
     request_authorizes_deletion,
     validate_output_rows,
@@ -142,6 +151,105 @@ class ContractTests(unittest.TestCase):
         for case in sample_cases:
             with self.subTest(case_id=case.case_id):
                 self.assertTrue(request_authorizes_deletion(case.request_text))
+
+    def test_orchestrates_non_deletion_without_resolving_or_investigating(self):
+        case = AuditCase(
+            case_id="case_fixture",
+            email="person@example.test",
+            requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            reported_status="COMPLETE",
+            reported_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            audit_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+            request_text="Please send me an export of my account information.",
+        )
+        resolver = Mock()
+        evidence_index = Mock()
+        activity_index = Mock()
+
+        result = orchestrate_case(case, resolver, evidence_index, activity_index, [])
+
+        self.assertEqual(OutputRow("case_fixture", "NOT_APPLICABLE", []), result)
+        resolver.resolve.assert_not_called()
+        evidence_index.search.assert_not_called()
+        activity_index.for_resource.assert_not_called()
+
+    def test_orchestrates_evidence_backed_incomplete_case_in_contract_order(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            case_id="case_fixture",
+            email="person@example.test",
+            requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            reported_status="COMPLETE",
+            reported_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            audit_at=audit_at,
+            request_text="Please delete my account.",
+        )
+        resolver = Mock()
+        resolver.resolve.return_value = ResolvedIdentity(
+            user_id="user_fixture",
+            values_at_audit={
+                "name": "Example Person",
+                "email": "person@example.test",
+                "phone": "+10000000000",
+                "email_hash": "fixture-hash",
+            },
+            historical_values={},
+        )
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    file_id="evidence_fixture",
+                    path=Path("fixture.log"),
+                    origin="test_fixture",
+                    captured_at=audit_at,
+                    text="account_001 remains for person@example.test",
+                )
+            ]
+        )
+        activity_index = ActivityIndex([])
+        rules = [DeletionRule("rule_fixture", "USER_PROFILE", "Always", "DELETE")]
+
+        result = orchestrate_case(case, resolver, evidence_index, activity_index, rules)
+
+        self.assertEqual("INCOMPLETE", result.deletion_status)
+        self.assertEqual(
+            ["FINDING", "REMEDIATION", "VERIFICATION"],
+            [step["phase"] for step in result.steps],
+        )
+        self.assertEqual(
+            ["REPORT_REMAINING_RECORD", "DELETE_RECORD", "VERIFY_RECORD_ABSENT"],
+            [step["operation"] for step in result.steps],
+        )
+        self.assertEqual([1, 2, 3], [step["step_no"] for step in result.steps])
+        self.assertEqual("evidence_fixture", result.steps[0]["evidence_id"])
+        self.assertEqual(["", ""], [step["evidence_id"] for step in result.steps[1:]])
+        validate_output_rows([case], [result])
+        resolver.resolve.assert_called_once_with(case.email, case.audit_at)
+
+    def test_orchestration_rejects_deletion_without_evidence_for_a_finding(self):
+        case = AuditCase(
+            case_id="case_fixture",
+            email="person@example.test",
+            requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            reported_status="NOT_STARTED",
+            reported_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            audit_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+            request_text="Please delete my account.",
+        )
+        resolver = Mock()
+        resolver.resolve.return_value = ResolvedIdentity(
+            user_id="user_fixture",
+            values_at_audit={
+                "name": "Example Person",
+                "email": "person@example.test",
+                "phone": "+10000000000",
+                "email_hash": "fixture-hash",
+            },
+            historical_values={},
+        )
+
+        with self.assertRaisesRegex(ContractError, "no evidence-backed resource state"):
+            orchestrate_case(case, resolver, EvidenceIndex([]), ActivityIndex([]), [])
 
     def test_plans_ordered_policy_actions_for_evidence_proven_record(self):
         case = next(item for item in load_requests(DATASET / "sample_deletion_requests.csv") if item.case_id == "case_05")
