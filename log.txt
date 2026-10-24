@@ -167,3 +167,25 @@ branch=personal/main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=/Users/riyarawat/hackerrank-orchestrate-october26
 parent_agent=none
+
+## 2026-10-24T15:37:46Z Implement resource state investigation
+
+User Prompt (verbatim, secrets redacted):
+implement next feature
+
+Agent Response Summary:
+Implemented activity and deletion-rule loaders plus a time-bounded investigation layer that correlates a resolved subject with resources found in the same evidence record or line. Activity events are retained as claims and are not treated as proof of resource state. Added an investigation CLI, policy/activity contract tests, and a regression test preventing unrelated records in the same evidence bundle from being incorrectly attributed to the subject.
+
+Actions:
+* Read participant-facing activity examples, policy rules, and evidence formats
+* Edited code/main.py, code/test_main.py, and README.md
+* Ran case investigation, ten unit tests, and git diff --check
+* Removed the generated code/__pycache__ test cache
+
+Context:
+tool=Codex desktop
+model=GPT-5
+branch=personal/main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none

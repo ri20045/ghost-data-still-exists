@@ -5,8 +5,11 @@ from main import (
     ContractError,
     OutputRow,
     load_evidence_index,
+    load_activity_index,
+    load_deletion_rules,
     load_identity_resolver,
     load_requests,
+    investigate_case,
     validate_output_rows,
     validate_steps,
 )
@@ -74,6 +77,21 @@ class ContractTests(unittest.TestCase):
             identity.all_identifiers, case.audit_at
         )
         self.assertTrue(all(item.captured_at <= case.audit_at for item in matches))
+
+    def test_loads_activity_and_policy_contracts(self):
+        self.assertEqual(4011, len(load_activity_index(DATASET / "system_activity.csv").events))
+        self.assertEqual(15, len(load_deletion_rules(DATASET / "deletion_rules.csv")))
+
+    def test_investigation_only_reports_resources_found_in_evidence_content(self):
+        case = next(item for item in load_requests(DATASET / "sample_deletion_requests.csv") if item.case_id == "case_05")
+        identity = load_identity_resolver(DATASET / "user_identities.csv", DATASET / "user_audit_log.csv").resolve(case.email, case.audit_at)
+        investigation = investigate_case(
+            case, identity, load_evidence_index(DATASET / "evidence_files.csv"),
+            load_activity_index(DATASET / "system_activity.csv"),
+        )
+        self.assertTrue(investigation.resources)
+        self.assertTrue(all(item.evidence_ids for item in investigation.resources))
+        self.assertEqual(["account_005"], [item.resource_id for item in investigation.resources])
 
 
 if __name__ == "__main__":

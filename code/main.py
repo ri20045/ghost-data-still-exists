@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -47,7 +48,17 @@ IDENTITY_COLUMNS = ("user_id", "name", "email", "phone", "email_hash", "updated_
 AUDIT_COLUMNS = ("audit_id", "user_id", "event_time", "field_name", "old_value", "new_value")
 IDENTITY_FIELDS = ("name", "email", "phone", "email_hash")
 EVIDENCE_COLUMNS = ("file_id", "file_path", "origin", "captured_at")
+ACTIVITY_COLUMNS = (
+    "activity_id", "event_time", "event_type", "source_system", "target_system",
+    "resource_id", "reported_result", "details",
+)
+RULE_COLUMNS = ("rule_id", "data_category", "condition", "required_action")
 TEXT_EVIDENCE_SUFFIXES = {".log", ".sql", ".txt"}
+# These are the resource namespaces represented by the participant-facing activity
+# stream and policy artifacts.  Deliberately exclude identity values such as user_05.
+RESOURCE_ID_PATTERN = re.compile(
+    r"\b(?:account|analytics|audit_record|backup|data_flow|export|search|support|tombstone)_\d+\b"
+)
 
 
 class ContractError(ValueError):
@@ -127,6 +138,122 @@ class EvidenceIndex:
             and evidence.text
             and any(needle in evidence.text.casefold() for needle in needles)
         ]
+
+
+@dataclass(frozen=True)
+class ActivityEvent:
+    activity_id: str
+    event_time: datetime
+    event_type: str
+    source_system: str
+    target_system: str
+    resource_id: str
+    reported_result: str
+    details: str
+
+
+@dataclass(frozen=True)
+class DeletionRule:
+    rule_id: str
+    data_category: str
+    condition: str
+    required_action: str
+
+
+@dataclass(frozen=True)
+class ResourceObservation:
+    resource_id: str
+    evidence_ids: tuple[str, ...]
+    activity_ids: tuple[str, ...]
+    latest_activity_claim: str | None
+
+
+@dataclass(frozen=True)
+class CaseInvestigation:
+    case_id: str
+    evidence_ids: tuple[str, ...]
+    resources: tuple[ResourceObservation, ...]
+
+
+class ActivityIndex:
+    def __init__(self, events: list[ActivityEvent]):
+        self.events = tuple(sorted(events, key=lambda event: (event.event_time, event.activity_id)))
+        self._by_resource: dict[str, list[ActivityEvent]] = defaultdict(list)
+        for event in self.events:
+            self._by_resource[event.resource_id].append(event)
+
+    def for_resource(self, resource_id: str, audit_at: datetime) -> list[ActivityEvent]:
+        return [event for event in self._by_resource.get(resource_id, []) if event.event_time <= audit_at]
+
+
+def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> set[str]:
+    """Find resources in the same evidence record or line as a subject identifier."""
+    needles = {value.casefold() for value in identifiers if value.strip()}
+    if not needles:
+        return set()
+    if evidence.path.suffix.casefold() == ".json":
+        try:
+            document = json.loads(evidence.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{evidence.path}: invalid JSON evidence") from error
+        found: set[str] = set()
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                serialized = json.dumps(value, ensure_ascii=False).casefold()
+                if any(needle in serialized for needle in needles):
+                    resource_id = value.get("resource_id")
+                    if isinstance(resource_id, str) and RESOURCE_ID_PATTERN.fullmatch(resource_id):
+                        found.add(resource_id)
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(document)
+        return found
+    return {
+        resource_id
+        for line in evidence.text.splitlines()
+        if any(needle in line.casefold() for needle in needles)
+        for resource_id in RESOURCE_ID_PATTERN.findall(line)
+    }
+
+
+def investigate_case(
+    case: AuditCase,
+    identity: ResolvedIdentity,
+    evidence_index: EvidenceIndex,
+    activity_index: ActivityIndex,
+) -> CaseInvestigation:
+    """Collect evidence-grounded candidate resources; activity is retained as an untrusted claim."""
+    evidence = evidence_index.search(identity.all_identifiers, case.audit_at)
+    resource_evidence: dict[str, set[str]] = defaultdict(set)
+    for item in evidence:
+        for resource_id in linked_resource_ids(item, identity.all_identifiers):
+            resource_evidence[resource_id].add(item.file_id)
+
+    observations: list[ResourceObservation] = []
+    for resource_id in sorted(resource_evidence):
+        events = activity_index.for_resource(resource_id, case.audit_at)
+        latest_claim = None
+        if events:
+            latest = events[-1]
+            latest_claim = f"{latest.event_type}:{latest.reported_result}"
+        observations.append(
+            ResourceObservation(
+                resource_id=resource_id,
+                evidence_ids=tuple(sorted(resource_evidence[resource_id])),
+                activity_ids=tuple(event.activity_id for event in events),
+                latest_activity_claim=latest_claim,
+            )
+        )
+    return CaseInvestigation(
+        case_id=case.case_id,
+        evidence_ids=tuple(item.file_id for item in evidence),
+        resources=tuple(observations),
+    )
 
 
 class IdentityResolver:
@@ -310,6 +437,44 @@ def load_evidence_index(manifest_path: Path, dataset_root: Path = DATASET_ROOT) 
     return EvidenceIndex(files)
 
 
+def load_activity_index(path: Path) -> ActivityIndex:
+    events: list[ActivityEvent] = []
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != ACTIVITY_COLUMNS:
+            raise ContractError(f"{path}: expected activity columns {ACTIVITY_COLUMNS}")
+        activity_ids: set[str] = set()
+        for row_number, row in enumerate(reader, start=2):
+            activity_id = row["activity_id"].strip()
+            if not activity_id or activity_id in activity_ids or not row["resource_id"].strip():
+                raise ContractError(f"{path}:{row_number}: invalid activity row")
+            activity_ids.add(activity_id)
+            events.append(
+                ActivityEvent(
+                    activity_id=activity_id,
+                    event_time=parse_timestamp(row["event_time"], field_name="event_time", case_id=activity_id),
+                    event_type=row["event_type"].strip(),
+                    source_system=row["source_system"].strip(),
+                    target_system=row["target_system"].strip(),
+                    resource_id=row["resource_id"].strip(),
+                    reported_result=row["reported_result"].strip(),
+                    details=row["details"],
+                )
+            )
+    return ActivityIndex(events)
+
+
+def load_deletion_rules(path: Path) -> list[DeletionRule]:
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != RULE_COLUMNS:
+            raise ContractError(f"{path}: expected rule columns {RULE_COLUMNS}")
+        rules = [DeletionRule(**row) for row in reader]
+    if not rules or len({rule.rule_id for rule in rules}) != len(rules):
+        raise ContractError(f"{path}: deletion rules must have unique IDs")
+    return rules
+
+
 def validate_steps(status: str, steps: list[dict[str, Any]], *, case_id: str) -> None:
     if status == "NOT_APPLICABLE":
         if steps:
@@ -384,11 +549,12 @@ def main() -> int:
     parser.add_argument("--compare-sample", type=Path, metavar="PATH", help="compare PATH with dataset/sample_output.csv")
     parser.add_argument("--resolve-case", metavar="CASE_ID", help="print a case's stable user ID and alias counts")
     parser.add_argument("--inspect-evidence", metavar="CASE_ID", help="count text evidence linked to a resolved case at audit_at")
+    parser.add_argument("--investigate-case", metavar="CASE_ID", help="list evidence-grounded resource candidates and activity claims")
     args = parser.parse_args()
 
     try:
         cases = load_requests(args.requests)
-        selected_case_id = args.resolve_case or args.inspect_evidence
+        selected_case_id = args.resolve_case or args.inspect_evidence or args.investigate_case
         if selected_case_id:
             case = next((item for item in cases if item.case_id == selected_case_id), None)
             if case is None:
@@ -401,6 +567,17 @@ def main() -> int:
             if args.inspect_evidence:
                 matches = load_evidence_index(DATASET_ROOT / "evidence_files.csv").search(identity.all_identifiers, case.audit_at)
                 print(f"Found {len(matches)} text-evidence item(s) for {case.case_id} at or before audit_at.")
+            if args.investigate_case:
+                investigation = investigate_case(
+                    case,
+                    identity,
+                    load_evidence_index(DATASET_ROOT / "evidence_files.csv"),
+                    load_activity_index(DATASET_ROOT / "system_activity.csv"),
+                )
+                print(
+                    f"Investigated {case.case_id}: {len(investigation.evidence_ids)} evidence item(s), "
+                    f"{len(investigation.resources)} evidence-grounded resource candidate(s)."
+                )
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:
