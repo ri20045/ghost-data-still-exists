@@ -235,6 +235,8 @@ class ResourceObservation:
     evidence_ids: tuple[str, ...]
     activity_ids: tuple[str, ...]
     latest_activity_claim: str | None
+    observed_state: str
+    state_evidence_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -290,6 +292,204 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
     }
 
 
+def _resource_state_from_result(result: str, resource_id: str) -> str:
+    normalized = result.casefold()
+    if normalized in {"not_found", "notfound", "miss", "absent"}:
+        return "ABSENT"
+    if normalized in {"redacted", "anonymized", "blocked"}:
+        if normalized == "blocked" and resource_id.startswith("backup_"):
+            return "BLOCKED"
+        return normalized.upper()
+    if normalized in {"active", "enabled"}:
+        if resource_id.startswith("data_flow_"):
+            return "ACTIVE"
+        if resource_id.startswith("backup_"):
+            return "RESTORABLE"
+        return "PRESENT"
+    if normalized in {"disabled", "inactive"} and resource_id.startswith("data_flow_"):
+        return "INACTIVE"
+    if normalized in {"restorable", "allowed", "available"} and resource_id.startswith("backup_"):
+        return "RESTORABLE"
+    if normalized in {"found", "identifiable", "hit", "present"}:
+        if resource_id.startswith("data_flow_"):
+            return "ACTIVE"
+        if resource_id.startswith("backup_"):
+            return "RESTORABLE"
+        return "PRESENT"
+    return "UNKNOWN"
+
+
+def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: bool = False) -> str:
+    normalized = text.casefold()
+    result = re.search(r"\bresult\s*[=:]\s*[\"']?([a-z_]+)", normalized)
+    if result:
+        state = _resource_state_from_result(result.group(1), resource_id)
+        if state != "UNKNOWN":
+            return state
+    if re.search(r"\brows\s*=\s*0\b|\bhttp_status\s*=\s*404\b", normalized):
+        return "ABSENT"
+    if re.search(r"\brows\s*=\s*[1-9]\d*\b|\bhttp_status\s*=\s*2\d\d\b", normalized):
+        return "PRESENT"
+    if resource_id.startswith("data_flow_") and re.search(
+        r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
+        r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?true\b",
+        normalized,
+    ):
+        return "ACTIVE"
+    if resource_id.startswith("data_flow_") and re.search(
+        r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?(?:disabled|inactive)\b"
+        r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?false\b",
+        normalized,
+    ):
+        return "INACTIVE"
+    if resource_id.startswith("backup_") and re.search(
+        r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?true\b"
+        r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
+        r"(?:allowed|available|enabled|restorable)\b",
+        normalized,
+    ):
+        return "RESTORABLE"
+    if resource_id.startswith("backup_") and re.search(
+        r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?false\b"
+        r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
+        r"(?:blocked|disabled|denied)\b",
+        normalized,
+    ):
+        return "BLOCKED"
+    if sql_statement and re.search(r"^\s*insert\s+into\b", normalized):
+        return "PRESENT"
+    if re.search(r"\b(?:record_state|resource_state)\s*[:=]\s*[\"']?present\b", normalized):
+        return "PRESENT"
+    return "UNKNOWN"
+
+
+def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -> str:
+    if any(
+        record.get(key) not in (None, "")
+        for key in ("email", "email_hash", "phone", "name", "full_name")
+    ):
+        return "PRESENT"
+    for key in ("record_state", "resource_state", "result"):
+        value = record.get(key)
+        if isinstance(value, str):
+            state = _resource_state_from_result(value, resource_id)
+            if state != "UNKNOWN":
+                return state
+    row_count = record.get("rows", record.get("row_count"))
+    if row_count == 0:
+        return "ABSENT"
+    if isinstance(row_count, int) and row_count > 0:
+        return "PRESENT"
+    return "UNKNOWN"
+
+
+def _resource_state_in_evidence(evidence: EvidenceFile, resource_id: str) -> str:
+    states: list[str] = []
+    if evidence.path.suffix.casefold() == ".json":
+        try:
+            document = json.loads(evidence.text)
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{evidence.path}: invalid JSON evidence") from error
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("resource_id") == resource_id:
+                    states.append(_resource_state_from_json_record(value, resource_id))
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(document)
+    else:
+        for line in evidence.text.splitlines():
+            if resource_id.casefold() in line.casefold():
+                states.append(
+                    _resource_state_from_text(
+                        line,
+                        resource_id,
+                        sql_statement=evidence.path.suffix.casefold() == ".sql",
+                    )
+                )
+
+    known_states = [state for state in states if state != "UNKNOWN"]
+    if resource_id.startswith("data_flow_"):
+        if "ACTIVE" in known_states:
+            return "ACTIVE"
+        if known_states and all(state == "INACTIVE" for state in known_states):
+            return "INACTIVE"
+        return "UNKNOWN"
+    if resource_id.startswith("backup_"):
+        if "RESTORABLE" in known_states:
+            return "RESTORABLE"
+        if known_states and all(state == "BLOCKED" for state in known_states):
+            return "BLOCKED"
+        return "UNKNOWN"
+    if "PRESENT" in known_states:
+        return "PRESENT"
+    if known_states and all(state == "ABSENT" for state in known_states):
+        return "ABSENT"
+    if "REDACTED" in known_states:
+        return "REDACTED"
+    if "ANONYMIZED" in known_states:
+        return "ANONYMIZED"
+    if "BLOCKED" in known_states:
+        return "BLOCKED"
+    return "UNKNOWN"
+
+
+def reconstruct_resource_states(
+    resources: Iterable[ResourceObservation], evidence_index: EvidenceIndex
+) -> tuple[ResourceObservation, ...]:
+    """Infer only resource states explicitly supported by linked evidence."""
+    evidence_by_id = {evidence.file_id: evidence for evidence in evidence_index.files}
+    reconstructed: list[ResourceObservation] = []
+    for resource in resources:
+        evidence_states = [
+            (evidence_id, _resource_state_in_evidence(evidence_by_id[evidence_id], resource.resource_id))
+            for evidence_id in resource.evidence_ids
+            if evidence_id in evidence_by_id
+        ]
+        states = {state for _, state in evidence_states}
+        if resource.resource_id.startswith("data_flow_") and "ACTIVE" in states:
+            state = "ACTIVE"
+        elif resource.resource_id.startswith("data_flow_") and states and states <= {"INACTIVE"}:
+            state = "INACTIVE"
+        elif resource.resource_id.startswith("backup_") and "RESTORABLE" in states:
+            state = "RESTORABLE"
+        elif resource.resource_id.startswith("backup_") and states and states <= {"BLOCKED"}:
+            state = "BLOCKED"
+        elif resource.resource_id.startswith(("data_flow_", "backup_")):
+            state = "UNKNOWN"
+        elif "PRESENT" in states:
+            state = "PRESENT"
+        elif states == {"ABSENT"}:
+            state = "ABSENT"
+        elif states == {"REDACTED"}:
+            state = "REDACTED"
+        elif states == {"ANONYMIZED"}:
+            state = "ANONYMIZED"
+        elif states == {"BLOCKED"}:
+            state = "BLOCKED"
+        else:
+            state = "UNKNOWN"
+        state_evidence_ids = tuple(
+            evidence_id for evidence_id, evidence_state in evidence_states if evidence_state == state
+        )
+        reconstructed.append(
+            ResourceObservation(
+                resource.resource_id,
+                resource.evidence_ids,
+                resource.activity_ids,
+                resource.latest_activity_claim,
+                state,
+                state_evidence_ids,
+            )
+        )
+    return tuple(reconstructed)
+
+
 def investigate_case(
     case: AuditCase,
     identity: ResolvedIdentity,
@@ -310,18 +510,22 @@ def investigate_case(
         if events:
             latest = events[-1]
             latest_claim = f"{latest.event_type}:{latest.reported_result}"
+        evidence_ids = tuple(sorted(resource_evidence[resource_id]))
         observations.append(
             ResourceObservation(
                 resource_id=resource_id,
-                evidence_ids=tuple(sorted(resource_evidence[resource_id])),
+                evidence_ids=evidence_ids,
                 activity_ids=tuple(event.activity_id for event in events),
                 latest_activity_claim=latest_claim,
+                observed_state="UNKNOWN",
+                state_evidence_ids=(),
             )
         )
+    resource_observations = tuple(observations)
     return CaseInvestigation(
         case_id=case.case_id,
         evidence_ids=tuple(item.file_id for item in evidence),
-        resources=tuple(observations),
+        resources=reconstruct_resource_states(resource_observations, evidence_index),
     )
 
 
@@ -391,27 +595,31 @@ def plan_investigation(
         prefix = resource_prefix(observation.resource_id)
         category = PREFIX_TO_CATEGORY[prefix]
         system_id = PREFIX_TO_SYSTEM[prefix]
-        evidence_id = observation.evidence_ids[0]
+        evidence_id = (
+            observation.state_evidence_ids[0]
+            if observation.state_evidence_ids
+            else ""
+        )
         action = action_by_category.get(category)
-        if prefix == "data_flow":
+        if prefix == "data_flow" and observation.observed_state == "ACTIVE":
             steps.extend((
                 make_step("FINDING", system_id, observation.resource_id, "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", evidence_id),
                 make_step("REMEDIATION", system_id, observation.resource_id, "DISABLE_DATA_FLOW", "DISABLED", ""),
                 make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_DATA_FLOW_DISABLED", "DISABLED", ""),
             ))
-        elif prefix == "backup":
+        elif prefix == "backup" and observation.observed_state == "RESTORABLE":
             steps.extend((
                 make_step("FINDING", system_id, observation.resource_id, "REPORT_RESTORE_RISK", "ACTIVE", evidence_id),
                 make_step("REMEDIATION", system_id, observation.resource_id, "BLOCK_RESTORE", "BLOCKED", ""),
                 make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_RESTORE_BLOCKED", "BLOCKED", ""),
             ))
-        elif action == "DELETE":
+        elif action == "DELETE" and observation.observed_state == "PRESENT":
             steps.extend((
                 make_step("FINDING", system_id, observation.resource_id, "REPORT_REMAINING_RECORD", "PRESENT", evidence_id),
                 make_step("REMEDIATION", system_id, observation.resource_id, "DELETE_RECORD", "ABSENT", ""),
                 make_step("VERIFICATION", system_id, observation.resource_id, "VERIFY_RECORD_ABSENT", "ABSENT", ""),
             ))
-        elif action in {"REDACT", "ANONYMIZE"}:
+        elif action in {"REDACT", "ANONYMIZE"} and observation.observed_state == "PRESENT":
             operation = "REDACT_RECORD" if action == "REDACT" else "ANONYMIZE_RECORD"
             state = "REDACTED" if action == "REDACT" else "ANONYMIZED"
             verify = "VERIFY_RECORD_REDACTED" if action == "REDACT" else "VERIFY_RECORD_ANONYMIZED"
@@ -423,7 +631,7 @@ def plan_investigation(
 
     if not steps:
         raise ContractError(
-            f"{case.case_id}: no evidence-backed resource state is available to prove completion or plan remediation"
+            f"{case.case_id}: no evidence-backed resource state is available to prove an unresolved requirement; completion evaluation is not implemented"
         )
     steps.sort(key=lambda step: (
         PHASE_ORDER[step["phase"]], OPERATION_ORDER[step["operation"]], step["system_id"], step["resource_id"]

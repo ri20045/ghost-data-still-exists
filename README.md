@@ -12,6 +12,8 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 Request intent is determined with deterministic multilingual rules. The classifier recognizes deletion and deletion-audit wording while excluding requests for access, correction, export, marketing opt-out, and explicit instructions not to delete.
 
+Single-case orchestration infers resource states only from linked evidence with explicit state signals. Unresolved or conflicting evidence does not establish `COMPLETE`; full completion evaluation and dataset output generation are not implemented yet.
+
 ---
 
 ## Quick Start
