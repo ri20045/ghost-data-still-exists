@@ -3,7 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import ContractError, OutputRow, load_requests, validate_output_rows, validate_steps
+from main import (
+    ContractError,
+    OutputRow,
+    load_identity_resolver,
+    load_requests,
+    validate_output_rows,
+    validate_steps,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +40,24 @@ class ContractTests(unittest.TestCase):
         cases = load_requests(DATASET / "sample_deletion_requests.csv")
         with self.assertRaises(ContractError):
             validate_output_rows(cases, [OutputRow("wrong", "NOT_APPLICABLE", [])])
+
+    def test_resolves_current_and_historical_request_emails(self):
+        resolver = load_identity_resolver(
+            DATASET / "user_identities.csv", DATASET / "user_audit_log.csv"
+        )
+        for case in load_requests(DATASET / "sample_deletion_requests.csv"):
+            identity = resolver.resolve(case.email, case.audit_at)
+            self.assertTrue(identity.user_id.startswith("user_"))
+            self.assertIn(case.email, identity.all_identifiers)
+
+    def test_rewinds_snapshot_for_changes_after_audit_cutoff(self):
+        resolver = load_identity_resolver(
+            DATASET / "user_identities.csv", DATASET / "user_audit_log.csv"
+        )
+        cases = load_requests(DATASET / "sample_deletion_requests.csv")
+        case = next(item for item in cases if item.case_id == "case_10")
+        identity = resolver.resolve(case.email, case.audit_at)
+        self.assertIn(case.email, identity.historical_values["email"])
 
 
 if __name__ == "__main__":

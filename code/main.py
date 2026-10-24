@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,10 +42,17 @@ STEP_FIELDS = {
     "state",
     "evidence_id",
 }
+IDENTITY_COLUMNS = ("user_id", "name", "email", "phone", "email_hash", "updated_at")
+AUDIT_COLUMNS = ("audit_id", "user_id", "event_time", "field_name", "old_value", "new_value")
+IDENTITY_FIELDS = ("name", "email", "phone", "email_hash")
 
 
 class ContractError(ValueError):
     """Raised when participant-facing input or generated output violates the contract."""
+
+
+class AmbiguousIdentityError(ContractError):
+    """Raised when an identifier maps to more than one stable user ID."""
 
 
 @dataclass(frozen=True)
@@ -63,6 +71,73 @@ class OutputRow:
     case_id: str
     deletion_status: str
     steps: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class IdentityChange:
+    audit_id: str
+    event_time: datetime
+    field_name: str
+    old_value: str
+    new_value: str
+
+
+@dataclass(frozen=True)
+class ResolvedIdentity:
+    """A subject and all identifiers relevant at the requested audit cutoff."""
+
+    user_id: str
+    values_at_audit: dict[str, str]
+    historical_values: dict[str, tuple[str, ...]]
+
+    @property
+    def all_identifiers(self) -> tuple[str, ...]:
+        values = set(self.values_at_audit.values())
+        for aliases in self.historical_values.values():
+            values.update(aliases)
+        return tuple(sorted(value for value in values if value))
+
+
+class IdentityResolver:
+    def __init__(self, snapshots: dict[str, dict[str, str]], changes: dict[str, list[IdentityChange]]):
+        self._snapshots = snapshots
+        self._changes = changes
+        self._email_index: dict[str, set[str]] = defaultdict(set)
+        for user_id, snapshot in snapshots.items():
+            self._add_email(user_id, snapshot["email"])
+        for user_id, events in changes.items():
+            for event in events:
+                if event.field_name == "email":
+                    self._add_email(user_id, event.old_value)
+                    self._add_email(user_id, event.new_value)
+
+    def _add_email(self, user_id: str, email: str) -> None:
+        normalized = email.strip().casefold()
+        if normalized:
+            self._email_index[normalized].add(user_id)
+
+    def resolve(self, email: str, audit_at: datetime) -> ResolvedIdentity:
+        candidates = self._email_index.get(email.strip().casefold(), set())
+        if not candidates:
+            raise ContractError(f"no identity found for request email {email!r}")
+        if len(candidates) != 1:
+            raise AmbiguousIdentityError(f"request email {email!r} maps to multiple users")
+        user_id = next(iter(candidates))
+        values = {field: self._snapshots[user_id][field] for field in IDENTITY_FIELDS}
+        historical: dict[str, set[str]] = {field: {value} if value else set() for field, value in values.items()}
+        for event in reversed(self._changes.get(user_id, [])):
+            if event.event_time > audit_at:
+                # Rewind the current snapshot to the state that existed at audit_at.
+                values[event.field_name] = event.old_value
+                historical[event.field_name].add(event.old_value)
+            else:
+                # Both sides were valid identifiers before the audit cutoff.
+                historical[event.field_name].update((event.old_value, event.new_value))
+        return ResolvedIdentity(
+            user_id=user_id,
+            values_at_audit=values,
+            historical_values={field: tuple(sorted(value for value in aliases if value)) for field, aliases in historical.items()},
+        )
 
 
 def parse_timestamp(value: str, *, field_name: str, case_id: str) -> datetime:
@@ -101,6 +176,47 @@ def load_requests(path: Path) -> list[AuditCase]:
                 )
             )
     return sorted(cases, key=lambda case: case.case_id)
+
+
+def load_identity_resolver(identities_path: Path, audit_log_path: Path) -> IdentityResolver:
+    """Load the participant-facing identity snapshot and its identifier history."""
+    snapshots: dict[str, dict[str, str]] = {}
+    with identities_path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != IDENTITY_COLUMNS:
+            raise ContractError(f"{identities_path}: expected identity columns {IDENTITY_COLUMNS}")
+        for row_number, row in enumerate(reader, start=2):
+            user_id = row["user_id"].strip()
+            if not user_id or user_id in snapshots:
+                raise ContractError(f"{identities_path}:{row_number}: missing or duplicate user_id")
+            parse_timestamp(row["updated_at"], field_name="updated_at", case_id=user_id)
+            snapshots[user_id] = {field: row[field].strip() for field in IDENTITY_FIELDS}
+
+    changes: dict[str, list[IdentityChange]] = defaultdict(list)
+    with audit_log_path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if tuple(reader.fieldnames or ()) != AUDIT_COLUMNS:
+            raise ContractError(f"{audit_log_path}: expected audit columns {AUDIT_COLUMNS}")
+        audit_ids: set[str] = set()
+        for row_number, row in enumerate(reader, start=2):
+            audit_id = row["audit_id"].strip()
+            user_id = row["user_id"].strip()
+            field_name = row["field_name"].strip()
+            if not audit_id or audit_id in audit_ids or user_id not in snapshots or field_name not in IDENTITY_FIELDS:
+                raise ContractError(f"{audit_log_path}:{row_number}: invalid identity audit row")
+            audit_ids.add(audit_id)
+            changes[user_id].append(
+                IdentityChange(
+                    audit_id=audit_id,
+                    event_time=parse_timestamp(row["event_time"], field_name="event_time", case_id=audit_id),
+                    field_name=field_name,
+                    old_value=row["old_value"].strip(),
+                    new_value=row["new_value"].strip(),
+                )
+            )
+    for events in changes.values():
+        events.sort(key=lambda event: (event.event_time, event.audit_id))
+    return IdentityResolver(snapshots, dict(changes))
 
 
 def validate_steps(status: str, steps: list[dict[str, Any]], *, case_id: str) -> None:
@@ -175,10 +291,19 @@ def main() -> int:
     parser.add_argument("--requests", type=Path, default=DATASET_ROOT / "deletion_requests.csv")
     parser.add_argument("--validate-output", type=Path, metavar="PATH")
     parser.add_argument("--compare-sample", type=Path, metavar="PATH", help="compare PATH with dataset/sample_output.csv")
+    parser.add_argument("--resolve-case", metavar="CASE_ID", help="print a case's stable user ID and alias counts")
     args = parser.parse_args()
 
     try:
         cases = load_requests(args.requests)
+        if args.resolve_case:
+            case = next((item for item in cases if item.case_id == args.resolve_case), None)
+            if case is None:
+                raise ContractError(f"case not found: {args.resolve_case}")
+            resolver = load_identity_resolver(DATASET_ROOT / "user_identities.csv", DATASET_ROOT / "user_audit_log.csv")
+            identity = resolver.resolve(case.email, case.audit_at)
+            alias_count = sum(len(values) for values in identity.historical_values.values())
+            print(f"Resolved {case.case_id} to {identity.user_id} with {alias_count} identifier values at or before audit_at.")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:
