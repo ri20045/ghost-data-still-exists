@@ -654,6 +654,44 @@ class ContractTests(unittest.TestCase):
             [resource.observed_state for resource in resources],
         )
 
+    def test_reconstructs_json_records_embedded_in_timestamped_logs(self):
+        evidence = EvidenceFile(
+            "evidence_json_log",
+            Path("structured.log"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            (
+                '2026-01-03T00:00:00Z {"resource_id":"search_001","result":"hit"}\n'
+                '2026-01-03T00:00:01Z {"resource_id":"analytics_001",'
+                '"matched_value":"person@example.test","direct_identifiers":"1"}\n'
+                '2026-01-03T00:00:02Z {"resource_id":"support_001",'
+                '"message_text":"[REDACTED]"}\n'
+                '2026-01-03T00:00:03Z {"resource_id":"data_flow_001",'
+                '"enabled":"true","scheduler_registered":"true"}\n'
+                '2026-01-03T00:00:04Z {"resource_id":"backup_001",'
+                '"restore_allowed":"false"}'
+            ),
+        )
+        resource_ids = (
+            "search_001",
+            "analytics_001",
+            "support_001",
+            "data_flow_001",
+            "backup_001",
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_json_log",), (), None, "UNKNOWN", ())
+                for resource_id in resource_ids
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["PRESENT", "PRESENT", "REDACTED", "ACTIVE", "BLOCKED"],
+            [resource.observed_state for resource in resources],
+        )
+
     def test_reconstructs_sql_backup_restore_flags(self):
         captured_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         evidence = EvidenceFile(

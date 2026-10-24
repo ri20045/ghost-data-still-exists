@@ -594,7 +594,28 @@ def _records_in_evidence(evidence: EvidenceFile, resource_id: str) -> list[dict[
             if resource_id.casefold() in line.casefold()
             if (record := _json_record_from_sql_line(line, resource_id)) is not None
         ]
-    return []
+    records = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("resource_id") == resource_id:
+                records.append(value)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for line in evidence.text.splitlines():
+        object_start = line.find("{")
+        if object_start < 0 or resource_id.casefold() not in line.casefold():
+            continue
+        try:
+            structured_record = json.loads(line[object_start:])
+        except json.JSONDecodeError:
+            continue
+        visit(structured_record)
+    return records
 
 
 def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -> str:
@@ -631,17 +652,17 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
         return "UNKNOWN"
     if resource_id.startswith("data_flow_"):
         enabled = record.get("enabled", record.get("scheduler_registered"))
-        if enabled is True:
+        if enabled is True or isinstance(enabled, str) and enabled.casefold() == "true":
             return "ACTIVE"
-        if enabled is False:
+        if enabled is False or isinstance(enabled, str) and enabled.casefold() == "false":
             return "INACTIVE"
     if resource_id.startswith("backup_"):
         restore_allowed = record.get(
             "restore_allowed", record.get("can_restore", record.get("restore_enabled"))
         )
-        if restore_allowed is True:
+        if restore_allowed is True or isinstance(restore_allowed, str) and restore_allowed.casefold() in {"true", "1"}:
             return "RESTORABLE"
-        if restore_allowed is False:
+        if restore_allowed is False or isinstance(restore_allowed, str) and restore_allowed.casefold() in {"false", "0"}:
             return "BLOCKED"
     if record.get("status_code") == 404:
         return "ABSENT"
@@ -654,6 +675,12 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
         if message_text.strip():
             return "PRESENT"
     if record.get("customer_reference") not in (None, "") or record.get("user_id") not in (None, ""):
+        return "PRESENT"
+    matched_value = record.get("matched_value")
+    if isinstance(matched_value, str) and matched_value.strip():
+        return "PRESENT"
+    direct_identifiers = record.get("direct_identifiers")
+    if direct_identifiers is True or isinstance(direct_identifiers, str) and direct_identifiers.casefold() in {"1", "true"}:
         return "PRESENT"
     if isinstance(record.get("profile"), dict) and record.get("status_code") == 200:
         return "PRESENT"
