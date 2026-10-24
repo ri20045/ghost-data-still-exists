@@ -512,3 +512,26 @@ branch=main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=main
 parent_agent=none
+
+## [2026-10-25T00:24:41+05:30] Improving identity-to-resource evidence correlation
+
+User Prompt (verbatim, secrets redacted):
+implement this next feature
+
+Agent Response Summary:
+Added a two-hop investigation path: pre-cutoff system activity can link a resolved identity to a resource, and pre-cutoff evidence containing that exact resource ID can then establish its state; activity claims themselves never prove state. Tightened identifier boundary matching and added focused tests plus documentation. Inspected the public sample mismatch: case_01/02 cite account_001/account_002 in evidence_54, which does not contain either ID; no participant evidence supports synthesizing those resources, so the mismatch is documented and left for source correction.
+
+Actions:
+* Edited README.md, code/main.py, and code/test_main.py.
+* Ran PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s code -p 'test_*.py' (33 passed), python3 -m py_compile code/main.py code/test_main.py, and git diff --check.
+* Smoke-tested sample case_03 (COMPLETE), case_05 (INCOMPLETE), and case_09 (INCOMPLETE); no full-dataset output was generated.
+* Checked all 32 public cases: 6 orchestrated and 26 correctly stopped on unsupported/unknown evidence; the prior committed version stopped on 25. The added activity linkage surfaced one more unknown-state resource (case_29), and the planner refused to assert a result for it.
+* Did not perform Git write operations; existing untracked code/__pycache__/ was left untouched.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none

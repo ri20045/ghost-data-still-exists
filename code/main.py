@@ -197,6 +197,13 @@ class EvidenceIndex:
 
     def __init__(self, files: list[EvidenceFile]):
         self.files = tuple(sorted(files, key=lambda item: (item.captured_at, item.file_id)))
+        by_resource: dict[str, list[EvidenceFile]] = defaultdict(list)
+        for evidence in self.files:
+            for resource_id in _resource_ids_in_evidence(evidence):
+                by_resource[resource_id].append(evidence)
+        self._by_resource = {
+            resource_id: tuple(items) for resource_id, items in by_resource.items()
+        }
 
     def search(self, identifiers: Iterable[str], audit_at: datetime) -> list[EvidenceFile]:
         needles = {value.casefold() for value in identifiers if value.strip()}
@@ -208,6 +215,13 @@ class EvidenceIndex:
             if evidence.captured_at <= audit_at
             and evidence.text
             and any(_identifier_in_text(evidence.text, needle) for needle in needles)
+        ]
+
+    def for_resource(self, resource_id: str, audit_at: datetime) -> list[EvidenceFile]:
+        return [
+            evidence
+            for evidence in self._by_resource.get(resource_id, ())
+            if evidence.captured_at <= audit_at
         ]
 
 
@@ -260,6 +274,42 @@ class ActivityIndex:
     def for_resource(self, resource_id: str, audit_at: datetime) -> list[ActivityEvent]:
         return [event for event in self._by_resource.get(resource_id, []) if event.event_time <= audit_at]
 
+    def linked_to_identifiers(
+        self, identifiers: Iterable[str], audit_at: datetime
+    ) -> list[ActivityEvent]:
+        needles = tuple(value for value in identifiers if value.strip())
+        return [
+            event
+            for event in self.events
+            if event.event_time <= audit_at
+            and any(_identifier_in_text(event.details, needle.casefold()) for needle in needles)
+        ]
+
+
+def _resource_ids_in_evidence(evidence: EvidenceFile) -> set[str]:
+    if evidence.path.suffix.casefold() == ".json":
+        try:
+            document = json.loads(evidence.text)
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{evidence.path}: invalid JSON evidence") from error
+
+        resource_ids: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                resource_id = value.get("resource_id")
+                if isinstance(resource_id, str) and RESOURCE_ID_PATTERN.fullmatch(resource_id):
+                    resource_ids.add(resource_id)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(document)
+        return resource_ids
+    return set(RESOURCE_ID_PATTERN.findall(evidence.text))
+
 
 def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> set[str]:
     """Find resources in the same evidence record or line as a subject identifier."""
@@ -297,11 +347,11 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
 
 
 def _identifier_in_text(text: str, identifier: str) -> bool:
-    if re.fullmatch(r"user_\d+", identifier, re.IGNORECASE):
-        return re.search(
-            rf"(?<![\w]){re.escape(identifier)}(?![\w])", text, re.IGNORECASE
-        ) is not None
-    return identifier in text.casefold()
+    if not identifier:
+        return False
+    return re.search(
+        rf"(?<![\w]){re.escape(identifier)}(?![\w])", text, re.IGNORECASE
+    ) is not None
 
 
 def _resource_state_from_result(result: str, resource_id: str) -> str:
@@ -739,12 +789,20 @@ def investigate_case(
     identifiers = (*identity.all_identifiers, identity.user_id)
     evidence = evidence_index.search(identifiers, case.audit_at)
     resource_evidence: dict[str, set[str]] = defaultdict(set)
+    resource_activity: dict[str, set[str]] = defaultdict(set)
     for item in evidence:
         for resource_id in linked_resource_ids(item, identifiers):
             resource_evidence[resource_id].add(item.file_id)
 
+    for event in activity_index.linked_to_identifiers(identifiers, case.audit_at):
+        if not RESOURCE_ID_PATTERN.fullmatch(event.resource_id):
+            continue
+        resource_activity[event.resource_id].add(event.activity_id)
+        for item in evidence_index.for_resource(event.resource_id, case.audit_at):
+            resource_evidence[event.resource_id].add(item.file_id)
+
     observations: list[ResourceObservation] = []
-    for resource_id in sorted(resource_evidence):
+    for resource_id in sorted(resource_evidence.keys() | resource_activity.keys()):
         events = activity_index.for_resource(resource_id, case.audit_at)
         latest_claim = None
         if events:
@@ -755,7 +813,10 @@ def investigate_case(
             ResourceObservation(
                 resource_id=resource_id,
                 evidence_ids=evidence_ids,
-                activity_ids=tuple(event.activity_id for event in events),
+                activity_ids=tuple(sorted({
+                    *(event.activity_id for event in events),
+                    *resource_activity.get(resource_id, set()),
+                })),
                 latest_activity_claim=latest_claim,
                 observed_state="UNKNOWN",
                 state_evidence_ids=(),

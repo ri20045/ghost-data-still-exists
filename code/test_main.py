@@ -112,6 +112,115 @@ class ContractTests(unittest.TestCase):
             item.file_id for item in index.search(["user_437"], captured_at)
         ])
 
+    def test_activity_identity_link_discovers_resource_but_evidence_proves_state(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_activity_link",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        identity = ResolvedIdentity(
+            "user_001",
+            {"name": "Example Person", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        activity = ActivityIndex(
+            [
+                ActivityEvent(
+                    "activity_link",
+                    audit_at,
+                    "SEARCH_LOOKUP",
+                    "search_service",
+                    "search_service",
+                    "search_001",
+                    "SUCCESS",
+                    "subject_email=person@example.test",
+                )
+            ]
+        )
+        evidence = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_resource",
+                    Path("search.json"),
+                    "test_fixture",
+                    audit_at,
+                    '{"resource_id":"search_001","result":"FOUND"}',
+                )
+            ]
+        )
+        investigation = investigate_case(case, identity, evidence, activity)
+
+        self.assertEqual(["search_001"], [item.resource_id for item in investigation.resources])
+        self.assertEqual("PRESENT", investigation.resources[0].observed_state)
+        self.assertEqual(("evidence_resource",), investigation.resources[0].state_evidence_ids)
+        self.assertIn("activity_link", investigation.resources[0].activity_ids)
+        result = plan_investigation(
+            case,
+            investigation,
+            [DeletionRule("rule_search", "SEARCH_INDEX_ENTRY", "Always", "DELETE")],
+        )
+        self.assertEqual("INCOMPLETE", result.deletion_status)
+        self.assertEqual("evidence_resource", result.steps[0]["evidence_id"])
+
+    def test_activity_link_without_pre_cutoff_evidence_does_not_prove_state(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_activity_only",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        identity = ResolvedIdentity(
+            "user_001",
+            {"name": "", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        activity = ActivityIndex(
+            [
+                ActivityEvent(
+                    "activity_only",
+                    audit_at,
+                    "SEARCH_LOOKUP",
+                    "search_service",
+                    "search_service",
+                    "search_001",
+                    "NOT_FOUND",
+                    "subject_email=person@example.test",
+                )
+            ]
+        )
+        future_evidence = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_future",
+                    Path("search.json"),
+                    "test_fixture",
+                    datetime(2026, 1, 4, tzinfo=timezone.utc),
+                    '{"resource_id":"search_001","result":"ABSENT"}',
+                )
+            ]
+        )
+
+        investigation = investigate_case(case, identity, future_evidence, activity)
+
+        self.assertEqual((), investigation.resources[0].evidence_ids)
+        self.assertEqual((), investigation.resources[0].state_evidence_ids)
+        self.assertEqual("UNKNOWN", investigation.resources[0].observed_state)
+        with self.assertRaisesRegex(ContractError, "state is unknown"):
+            plan_investigation(
+                case,
+                investigation,
+                [DeletionRule("rule_search", "SEARCH_INDEX_ENTRY", "Always", "DELETE")],
+            )
+
     def test_loads_activity_and_policy_contracts(self):
         self.assertEqual(4011, len(load_activity_index(DATASET / "system_activity.csv").events))
         self.assertEqual(15, len(load_deletion_rules(DATASET / "deletion_rules.csv")))

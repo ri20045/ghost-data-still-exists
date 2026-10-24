@@ -12,7 +12,9 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 Request intent is determined with deterministic multilingual rules. The classifier recognizes deletion and deletion-audit wording while excluding requests for access, correction, export, marketing opt-out, and explicit instructions not to delete.
 
-Single-case orchestration infers resource states only from linked evidence, applies the supplied delete/redact/anonymize/retain rules, and emits evidence-backed verification for discovered resources that meet policy. Tombstones are correlated by their stable `user_id`; retention cutoffs, active legal holds, and blocked backup restores are checked explicitly. Unknown state or policy conditions prevent a completion decision. This evaluator does not establish that evidence discovery is globally exhaustive, and batch processing/output generation are not implemented yet.
+Single-case orchestration correlates resources through direct identity matches and identity-linked activity references. Activity can identify a resource to inspect, but only resource-specific participant evidence captured by `audit_at` can establish its state. The planner applies the supplied delete/redact/anonymize/retain rules and emits verification for discovered resources that meet policy. Tombstones are correlated by their stable `user_id`; retention cutoffs, active legal holds, and blocked backup restores are checked explicitly. Unknown state or policy conditions prevent a completion decision. This evaluator does not establish that evidence discovery is globally exhaustive, and batch processing/output generation are not implemented yet.
+
+The public sample has a source inconsistency: `sample_output.csv` cites `account_001` and `account_002` in `evidence_54` for its first two cases, but the participant-facing evidence file does not contain those resource IDs. The implementation does not use sample answers to fabricate evidence; clarify or correct this discrepancy before relying on full-dataset completion results.
 
 ---
 
