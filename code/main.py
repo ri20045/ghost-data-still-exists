@@ -383,45 +383,51 @@ def _resource_state_from_result(result: str, resource_id: str) -> str:
 
 def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: bool = False) -> str:
     normalized = text.casefold()
+    if resource_id.startswith("data_flow_"):
+        if re.search(
+            r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
+            r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?true\b",
+            normalized,
+        ):
+            return "ACTIVE"
+        if re.search(
+            r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?(?:disabled|inactive)\b"
+            r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?false\b",
+            normalized,
+        ):
+            return "INACTIVE"
+    if resource_id.startswith("backup_"):
+        if re.search(
+            r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?true\b"
+            r"|\brestore_allowed\s*=\s*[\"']?(?:true|1)(?:\b|[\"'])"
+            r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
+            r"(?:allowed|available|enabled|restorable)\b",
+            normalized,
+        ):
+            return "RESTORABLE"
+        if re.search(
+            r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?false\b"
+            r"|\brestore_allowed\s*=\s*[\"']?(?:false|0)(?:\b|[\"'])"
+            r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
+            r"(?:blocked|disabled|denied)\b",
+            normalized,
+        ):
+            return "BLOCKED"
     result = re.search(r"\bresult\s*[=:]\s*[\"']?([a-z_]+)", normalized)
+    if result and _resource_state_from_result(result.group(1), resource_id) == "ABSENT":
+        return "ABSENT"
+    if re.search(r"\brows\s*=\s*0\b|\bhttp_status\s*=\s*404\b", normalized):
+        return "ABSENT"
+    if not resource_id.startswith(("data_flow_", "backup_")) and _text_has_direct_identifier(normalized):
+        return "PRESENT"
     if result:
         state = _resource_state_from_result(result.group(1), resource_id)
         if state != "UNKNOWN" and not (
             resource_id.startswith("tombstone_") and state == "REDACTED"
         ):
             return state
-    if re.search(r"\brows\s*=\s*0\b|\bhttp_status\s*=\s*404\b", normalized):
-        return "ABSENT"
     if re.search(r"\brows\s*=\s*[1-9]\d*\b|\bhttp_status\s*=\s*2\d\d\b", normalized):
         return "PRESENT"
-    if resource_id.startswith("data_flow_") and re.search(
-        r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
-        r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?true\b",
-        normalized,
-    ):
-        return "ACTIVE"
-    if resource_id.startswith("data_flow_") and re.search(
-        r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?(?:disabled|inactive)\b"
-        r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?false\b",
-        normalized,
-    ):
-        return "INACTIVE"
-    if resource_id.startswith("backup_") and re.search(
-        r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?true\b"
-        r"|\brestore_allowed\s*=\s*[\"']?(?:true|1)(?:\b|[\"'])"
-        r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
-        r"(?:allowed|available|enabled|restorable)\b",
-        normalized,
-    ):
-        return "RESTORABLE"
-    if resource_id.startswith("backup_") and re.search(
-        r"\b(?:can_restore|restore_enabled)\s*=\s*[\"']?false\b"
-        r"|\brestore_allowed\s*=\s*[\"']?(?:false|0)(?:\b|[\"'])"
-        r"|\b(?:restore_access|restore_state|restore_status)\s*[:=]\s*[\"']?"
-        r"(?:blocked|disabled|denied)\b",
-        normalized,
-    ):
-        return "BLOCKED"
     if resource_id.startswith("tombstone_"):
         stable_reference = re.search(
             r"\bsubject_reference\s*[=:]\s*[\"']?user_\d+\b", normalized
@@ -446,6 +452,15 @@ def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: boo
         ):
             return "PRESENT"
         return "UNKNOWN"
+    row_state = re.search(
+        r"\|\s*(not_found|identifiable|anonymized|redacted|active|inactive|"
+        r"found|absent|present|restorable|blocked)\s*\|",
+        normalized,
+    )
+    if row_state:
+        state = _resource_state_from_result(row_state.group(1), resource_id)
+        if state != "UNKNOWN":
+            return state
     if sql_statement:
         values = _sql_values_from_line(text)
         if values and values[0] == resource_id:
@@ -464,6 +479,39 @@ def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: boo
     if re.search(r"\b(?:record_state|resource_state)\s*[:=]\s*[\"']?present\b", normalized):
         return "PRESENT"
     return "UNKNOWN"
+
+
+def _text_has_direct_identifier(text: str) -> bool:
+    matched_value = re.search(
+        r"\bmatched_value\s*[=:]\s*(?:\"([^\"]*)\"|'([^']*)'|([^,\s|]+))",
+        text,
+        re.IGNORECASE,
+    )
+    if matched_value:
+        value = next((part for part in matched_value.groups() if part is not None), "").strip()
+        return value.casefold() not in {"", "null", "none", "n/a", "[redacted]"}
+    event = re.search(r"\bevent\s*[=:]\s*[\"']?([\w-]+)", text, re.IGNORECASE)
+    if not event or not re.search(
+        r"(?:read|lookup|fetch|query|search|scan).*(?:completed|complete|hit|matched|found)$",
+        event.group(1),
+        re.IGNORECASE,
+    ):
+        return False
+    field = (
+        r"(?:email|email_address|owner_email|customer_email|requester_email|"
+        r"subject_email|contact_email|phone|phone_number|owner_phone|customer_phone|"
+        r"requester_phone|name|full_name|display_name|requester_name|email_hash)"
+    )
+    matches = re.finditer(
+        rf"\b{field}\s*[=:]\s*(?:\"([^\"]*)\"|'([^']*)'|([^,\s|]+))",
+        text,
+        re.IGNORECASE,
+    )
+    for match in matches:
+        value = next((part for part in match.groups() if part is not None), "").strip()
+        if value.casefold() not in {"", "null", "none", "n/a", "[redacted]"}:
+            return True
+    return False
 
 
 def _sql_values_from_line(line: str) -> list[str] | None:
@@ -543,8 +591,51 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
     direct_identifier_fields = (
         "email", "email_hash", "phone", "name", "full_name",
         "requester_email", "requester_phone", "requester_name",
+        "owner_email", "owner_phone", "customer_email", "customer_phone",
+        "subject_email", "contact_email", "email_address", "phone_number",
+        "display_name",
     )
-    if any(record.get(key) not in (None, "") for key in direct_identifier_fields):
+
+    def has_identifier(value: Any) -> bool:
+        if isinstance(value, dict):
+            if any(value.get(key) not in (None, "") for key in direct_identifier_fields):
+                return True
+            return any(has_identifier(child) for child in value.values())
+        if isinstance(value, list):
+            return any(has_identifier(child) for child in value)
+        return False
+
+    subject_reference = record.get("subject_reference")
+    if resource_id.startswith("tombstone_"):
+        if (
+            re.fullmatch(r"user_\d+", str(subject_reference or ""))
+            and record.get("account_status") == "DELETED"
+            and all(
+                field in record and record[field] in (None, "")
+                for field in ("name", "email", "phone", "email_hash")
+            )
+        ):
+            return "REDACTED"
+        if has_identifier(record):
+            return "PRESENT"
+        return "UNKNOWN"
+    if resource_id.startswith("data_flow_"):
+        enabled = record.get("enabled", record.get("scheduler_registered"))
+        if enabled is True:
+            return "ACTIVE"
+        if enabled is False:
+            return "INACTIVE"
+    if resource_id.startswith("backup_"):
+        restore_allowed = record.get(
+            "restore_allowed", record.get("can_restore", record.get("restore_enabled"))
+        )
+        if restore_allowed is True:
+            return "RESTORABLE"
+        if restore_allowed is False:
+            return "BLOCKED"
+    if record.get("status_code") == 404:
+        return "ABSENT"
+    if has_identifier(record):
         return "PRESENT"
     message_text = record.get("message_text")
     if resource_id.startswith("support_") and isinstance(message_text, str):
@@ -552,25 +643,14 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
             return "REDACTED"
         if message_text.strip():
             return "PRESENT"
-    if resource_id.startswith("analytics_") and record.get("user_id") not in (None, ""):
+    if record.get("customer_reference") not in (None, "") or record.get("user_id") not in (None, ""):
         return "PRESENT"
-    subject_reference = record.get("subject_reference")
-    if isinstance(subject_reference, str) and subject_reference and not re.fullmatch(
-        r"user_\d+", subject_reference
-    ):
+    if isinstance(record.get("profile"), dict) and record.get("status_code") == 200:
         return "PRESENT"
-    if resource_id.startswith("tombstone_"):
-        if (
-            re.fullmatch(r"user_\d+", str(subject_reference or ""))
-            and record.get("account_status") == "DELETED"
-            and all(field in record and record[field] in (None, "") for field in direct_identifier_fields[:4])
-        ):
-            return "REDACTED"
-        return "UNKNOWN"
     if (
         resource_id.startswith("audit_record_")
         and re.fullmatch(r"user_\d+", str(subject_reference or ""))
-        and record.get("event_name")
+        and (record.get("event_name") or record.get("event_code"))
         and record.get("retention_until")
     ):
         return "PRESENT"

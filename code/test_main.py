@@ -521,6 +521,79 @@ class ContractTests(unittest.TestCase):
         )
         self.assertTrue(all(step["evidence_id"] for step in result.steps[:2]))
 
+    def test_reconstructs_nested_json_records_and_export_jobs(self):
+        captured_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_structured",
+            Path("snapshot.json"),
+            "test_fixture",
+            captured_at,
+            (
+                '{"records":['
+                '{"resource_id":"export_001","owner_email":"person@example.test",'
+                '"download_available":true},'
+                '{"resource_id":"account_001","status_code":404,"profile":null},'
+                '{"resource_id":"data_flow_001","enabled":true},'
+                '{"resource_id":"analytics_001","profile":{"email":"person@example.test",'
+                '"phone":null}},'
+                '{"resource_id":"audit_record_001","subject_reference":"user_001",'
+                '"event_code":"ACCOUNT_DELETION_RECORDED",'
+                '"retention_until":"2030-12-31T23:59:59Z"}]}'
+            ),
+        )
+        resource_ids = [
+            "export_001",
+            "account_001",
+            "data_flow_001",
+            "analytics_001",
+            "audit_record_001",
+        ]
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_structured",), (), None, "UNKNOWN", ())
+                for resource_id in resource_ids
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["PRESENT", "ABSENT", "ACTIVE", "PRESENT", "PRESENT"],
+            [resource.observed_state for resource in resources],
+        )
+        self.assertEqual(
+            datetime(2030, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+            resources[-1].retention_until,
+        )
+
+    def test_reconstructs_pipe_delimited_resource_statuses(self):
+        evidence = EvidenceFile(
+            "evidence_inventory",
+            Path("inventory.txt"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            (
+                "- 2026-01-03T00:00:00Z | account_service | account_001 "
+                "| USER_PROFILE | NOT_FOUND | lookup\n"
+                "- 2026-01-03T00:00:00Z | search_service | search_001 "
+                "| SEARCH_INDEX_ENTRY | FOUND | match\n"
+                "- 2026-01-03T00:00:00Z | integration_service | data_flow_001 "
+                "| DATA_FLOW | ACTIVE | enabled"
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation("account_001", ("evidence_inventory",), (), None, "UNKNOWN", ()),
+                ResourceObservation("search_001", ("evidence_inventory",), (), None, "UNKNOWN", ()),
+                ResourceObservation("data_flow_001", ("evidence_inventory",), (), None, "UNKNOWN", ()),
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["ABSENT", "PRESENT", "ACTIVE"],
+            [resource.observed_state for resource in resources],
+        )
+
     def test_reconstructs_sql_backup_restore_flags(self):
         captured_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         evidence = EvidenceFile(
