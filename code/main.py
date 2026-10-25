@@ -20,8 +20,8 @@ import tempfile
 import unicodedata
 import warnings
 from collections import Counter, defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -230,37 +230,54 @@ class EvidenceIndex:
         self._by_resource = {
             resource_id: tuple(items) for resource_id, items in by_resource.items()
         }
+        self.timestamp_conflicts = tuple(
+            (evidence.file_id, resource_id, event_at)
+            for evidence in self.files
+            for resource_id, event_at in _record_event_timestamps(evidence)
+            if event_at > evidence.captured_at
+        )
+
+    @staticmethod
+    def _available_at(evidence: EvidenceFile, audit_at: datetime) -> EvidenceFile | None:
+        if evidence.captured_at > audit_at:
+            return None
+        text = _evidence_text_as_of(evidence, audit_at)
+        if not text.strip():
+            return None
+        return evidence if text == evidence.text else replace(evidence, text=text)
 
     def search(self, identifiers: Iterable[str], audit_at: datetime) -> list[EvidenceFile]:
         needles = {value.casefold() for value in identifiers if value.strip()}
         if not needles:
             return []
-        return [
-            evidence
-            for evidence in self.files
-            if evidence.captured_at <= audit_at
-            and evidence.text
-            and any(_identifier_in_text(evidence.text, needle) for needle in needles)
-        ]
+        matches = []
+        for evidence in self.files:
+            available = self._available_at(evidence, audit_at)
+            if available and any(
+                _identifier_in_text(available.text, needle) for needle in needles
+            ):
+                matches.append(available)
+        return matches
 
     def for_resource(self, resource_id: str, audit_at: datetime) -> list[EvidenceFile]:
         return [
-            evidence
+            available
             for evidence in self._by_resource.get(resource_id, ())
-            if evidence.captured_at <= audit_at
+            if (available := self._available_at(evidence, audit_at)) is not None
         ]
 
     def search_content(self, terms: Iterable[str], audit_at: datetime) -> list[EvidenceFile]:
         needles = tuple(term.casefold() for term in terms if term.strip())
         if not needles:
             return []
-        return [
-            evidence
-            for evidence in self.files
-            if evidence.captured_at <= audit_at
-            and evidence.text
-            and any(_identifier_in_text(evidence.text, needle) for needle in needles)
-        ]
+        matches = []
+        for evidence in self.files:
+            available = self._available_at(evidence, audit_at)
+            if available and any(
+                _identifier_in_text(available.text, needle) for needle in needles
+            ):
+                matches.append(available)
+        return matches
 
 
 @dataclass(frozen=True)
@@ -355,6 +372,12 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
     needles = {value.casefold() for value in identifiers if value.strip()}
     if not needles:
         return set()
+    if evidence.path.suffix.casefold() == ".pdf":
+        resources = _resource_ids_in_evidence(evidence)
+        if len(resources) == 1 and any(
+            _identifier_in_text(evidence.text, needle) for needle in needles
+        ):
+            return resources
     if evidence.path.suffix.casefold() == ".json":
         try:
             document = json.loads(evidence.text)
@@ -472,6 +495,13 @@ def _resource_state_from_text(
             normalized,
         ):
             return "BLOCKED"
+    if (
+        resource_id.startswith("audit_record_")
+        and _identifier_in_text(normalized, resource_id.casefold())
+        and re.search(r"\bsubject reference user_\d+\b", normalized)
+        and re.search(r"\b(?:event|journal entry)\b", normalized)
+    ):
+        return "PRESENT"
     result = re.search(r"\bresult\s*[=:]\s*[\"']?([a-z_]+)", normalized)
     if result and _resource_state_from_result(result.group(1), resource_id) == "ABSENT":
         return "ABSENT"
@@ -625,6 +655,229 @@ def _sql_values_from_line(line: str) -> list[str] | None:
     return values
 
 
+EVENT_TIMESTAMP_FIELDS = {
+    "created_at",
+    "event_time",
+    "occurred_at",
+    "observed_at",
+    "recorded_at",
+    "updated_at",
+}
+FILTERED_RECORD = object()
+ISO_TIMESTAMP_PATTERN = re.compile(
+    r"\b20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?\b"
+)
+
+
+def _timestamp_values(record: dict[str, Any]) -> list[datetime]:
+    timestamps = []
+    for key, value in record.items():
+        if key.casefold() not in EVENT_TIMESTAMP_FIELDS or not isinstance(value, str):
+            continue
+        match = ISO_TIMESTAMP_PATTERN.search(value)
+        if match:
+            timestamps.append(
+                parse_timestamp(
+                    match.group(0),
+                    field_name=key,
+                    case_id=str(record.get("resource_id", "evidence")),
+                )
+            )
+    return timestamps
+
+
+def _json_record_timestamps(value: Any) -> list[tuple[str, datetime]]:
+    timestamps: list[tuple[str, datetime]] = []
+    if isinstance(value, dict):
+        resource_id = value.get("resource_id", "")
+        if isinstance(resource_id, str):
+            timestamps.extend((resource_id, item) for item in _timestamp_values(value))
+        for child in value.values():
+            timestamps.extend(_json_record_timestamps(child))
+    elif isinstance(value, list):
+        for child in value:
+            timestamps.extend(_json_record_timestamps(child))
+    return timestamps
+
+
+def _filtered_json_value(value: Any, audit_at: datetime) -> Any:
+    if isinstance(value, dict):
+        record_timestamps = _timestamp_values(value)
+        if value.get("resource_id") and any(
+            timestamp > audit_at for timestamp in record_timestamps
+        ):
+            return FILTERED_RECORD
+        filtered = {}
+        for key, child in value.items():
+            filtered_child = _filtered_json_value(child, audit_at)
+            if filtered_child is not FILTERED_RECORD:
+                filtered[key] = filtered_child
+        return filtered
+    if isinstance(value, list):
+        return [
+            filtered
+            for child in value
+            if (filtered := _filtered_json_value(child, audit_at))
+            is not FILTERED_RECORD
+        ]
+    return value
+
+
+def _sql_table_columns(text: str, table_name: str) -> list[str]:
+    definition = re.search(
+        rf"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"`\[]?"
+        rf"{re.escape(table_name)}[\"`\]]?\s*\(",
+        text,
+        re.IGNORECASE,
+    )
+    if not definition:
+        return []
+    opening = text.find("(", definition.start())
+    depth = 1
+    quoted: str | None = None
+    index = opening + 1
+    token: list[str] = []
+    definitions: list[str] = []
+    while index < len(text) and depth:
+        character = text[index]
+        if quoted:
+            if character == quoted:
+                if index + 1 < len(text) and text[index + 1] == quoted:
+                    token.append(character)
+                    index += 2
+                    continue
+                quoted = None
+        elif character in {"'", '"', "`"}:
+            quoted = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                definitions.append("".join(token))
+                break
+        elif character == "," and depth == 1:
+            definitions.append("".join(token))
+            token.clear()
+            index += 1
+            continue
+        token.append(character)
+        index += 1
+
+    columns = []
+    for item in definitions:
+        match = re.match(r'\s*(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|(\w+))', item)
+        if match:
+            columns.append(next(group for group in match.groups() if group is not None))
+    return columns
+
+
+def _sql_insert_timestamps(text: str, line: str) -> list[tuple[str, datetime]]:
+    insert = re.search(
+        r"\bINSERT\s+INTO\s+[\"`\[]?([\w-]+)[\"`\]]?"
+        r"\s*(?:\(([^)]*)\))?\s+VALUES\s*\(",
+        line,
+        re.IGNORECASE,
+    )
+    values = _sql_values_from_line(line)
+    if not insert or values is None:
+        return []
+    table_name = insert.group(1)
+    raw_columns = insert.group(2)
+    columns = (
+        [column.strip().strip('"`[]') for column in raw_columns.split(",")]
+        if raw_columns
+        else _sql_table_columns(text, table_name)
+    )
+    row = dict(zip(columns, values)) if len(columns) == len(values) else {}
+    timestamps: list[tuple[str, datetime]] = []
+    for value in values:
+        try:
+            record = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            timestamps.extend(_json_record_timestamps(record))
+    resource_id = row.get("resource_id", "")
+    if not resource_id:
+        resource_ids = [resource for resource, _ in timestamps if resource]
+        resource_id = resource_ids[0] if resource_ids else ""
+    timestamps.extend(
+        (resource_id, timestamp)
+        for timestamp in _timestamp_values(row)
+    )
+    return timestamps
+
+
+def _record_event_timestamps(
+    evidence: EvidenceFile,
+) -> list[tuple[str, datetime]]:
+    suffix = evidence.path.suffix.casefold()
+    if suffix == ".json":
+        try:
+            return _json_record_timestamps(json.loads(evidence.text))
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{evidence.path}: invalid JSON evidence") from error
+    if suffix == ".sql":
+        return [
+            timestamp
+            for line in evidence.text.splitlines()
+            for timestamp in _sql_insert_timestamps(evidence.text, line)
+        ]
+    if suffix in {".log", ".txt"}:
+        timestamps = []
+        for line in evidence.text.splitlines():
+            match = ISO_TIMESTAMP_PATTERN.search(line)
+            resource_match = RESOURCE_ID_PATTERN.search(line)
+            if match and resource_match:
+                timestamps.append(
+                    (
+                        resource_match.group(0),
+                        parse_timestamp(
+                            match.group(0),
+                            field_name="event_time",
+                            case_id=evidence.file_id,
+                        ),
+                    )
+                )
+        return timestamps
+    return []
+
+
+def _evidence_text_as_of(evidence: EvidenceFile, audit_at: datetime) -> str:
+    suffix = evidence.path.suffix.casefold()
+    if suffix == ".json":
+        try:
+            document = json.loads(evidence.text)
+        except json.JSONDecodeError as error:
+            raise ContractError(f"{evidence.path}: invalid JSON evidence") from error
+        filtered = _filtered_json_value(document, audit_at)
+        if filtered is FILTERED_RECORD:
+            return ""
+        return json.dumps(filtered, ensure_ascii=False, sort_keys=True)
+    if suffix == ".sql":
+        lines = []
+        for line in evidence.text.splitlines():
+            timestamps = _sql_insert_timestamps(evidence.text, line)
+            if any(timestamp > audit_at for _, timestamp in timestamps):
+                continue
+            lines.append(line)
+        return "\n".join(lines)
+    if suffix in {".log", ".txt"}:
+        lines = []
+        for line in evidence.text.splitlines():
+            match = ISO_TIMESTAMP_PATTERN.search(line)
+            if match and parse_timestamp(
+                match.group(0),
+                field_name="event_time",
+                case_id=evidence.file_id,
+            ) > audit_at:
+                continue
+            lines.append(line)
+        return "\n".join(lines)
+    return evidence.text
+
+
 def _json_record_from_sql_line(line: str, resource_id: str) -> dict[str, Any] | None:
     values = _sql_values_from_line(line)
     if values is None:
@@ -767,6 +1020,12 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
         return "PRESENT"
     if isinstance(record.get("profile"), dict) and record.get("status_code") == 200:
         return "PRESENT"
+    for key in ("record_state", "resource_state", "result"):
+        value = record.get(key)
+        if isinstance(value, str):
+            state = _resource_state_from_result(value, resource_id)
+            if state != "UNKNOWN":
+                return state
     if (
         resource_id.startswith("audit_record_")
         and re.fullmatch(r"user_\d+", str(subject_reference or ""))
@@ -779,12 +1038,6 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
         for key in ("hold_status", "hold_state", "hold_active", "active")
     ):
         return "PRESENT"
-    for key in ("record_state", "resource_state", "result"):
-        value = record.get(key)
-        if isinstance(value, str):
-            state = _resource_state_from_result(value, resource_id)
-            if state != "UNKNOWN":
-                return state
     row_count = record.get("rows", record.get("row_count"))
     if isinstance(row_count, str) and row_count.isdigit():
         row_count = int(row_count)
@@ -811,7 +1064,15 @@ def _resource_state_in_evidence(
         return "PRESENT"
     records = _records_in_evidence(evidence, resource_id)
     states = [_resource_state_from_json_record(record, resource_id) for record in records]
-    if evidence.path.suffix.casefold() not in {".json", ".sql"}:
+    if evidence.path.suffix.casefold() == ".pdf":
+        if _identifier_in_text(evidence.text, resource_id.casefold()):
+            states.append(
+                _resource_state_from_text(
+                    evidence.text,
+                    resource_id,
+                )
+            )
+    elif evidence.path.suffix.casefold() not in {".json", ".sql"}:
         for line in evidence.text.splitlines():
             if resource_id.casefold() in line.casefold():
                 states.append(
@@ -897,6 +1158,24 @@ def _policy_metadata_from_text(text: str, resource_id: str) -> tuple[datetime | 
         if retention_match
         else None
     )
+    if retention_until is None:
+        human_retention_match = re.search(
+            r"\bretain\s+until\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})"
+            r"(?:\s+(\d{1,2})\s+(\d{2}))?\s+UTC\b",
+            text,
+            re.IGNORECASE,
+        )
+        if human_retention_match:
+            date_text, hour, minute = human_retention_match.groups()
+            value = f"{date_text} {hour or '00'} {minute or '00'} UTC"
+            try:
+                retention_until = datetime.strptime(
+                    value, "%d %b %Y %H %M %Z"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError as error:
+                raise ContractError(
+                    f"{resource_id}: invalid human-readable retention timestamp {value!r}"
+                ) from error
     policy_active = None
     if resource_id.startswith("legal_hold_"):
         active_match = re.search(
@@ -964,24 +1243,34 @@ def _policy_metadata_from_sql(text: str, resource_id: str) -> list[datetime]:
 
 
 def reconstruct_resource_states(
-    resources: Iterable[ResourceObservation], evidence_index: EvidenceIndex
+    resources: Iterable[ResourceObservation],
+    evidence_index: EvidenceIndex,
+    *,
+    audit_at: datetime | None = None,
 ) -> tuple[ResourceObservation, ...]:
     """Infer only resource states explicitly supported by linked evidence."""
     evidence_by_id = {evidence.file_id: evidence for evidence in evidence_index.files}
     reconstructed: list[ResourceObservation] = []
     for resource in resources:
-        evidence_states = [
-            (
-                evidence_id,
-                _resource_state_in_evidence(
-                    evidence_by_id[evidence_id],
-                    resource.resource_id,
-                    resource.evidence_link_terms,
-                ),
+        evidence_states = []
+        for evidence_id in resource.evidence_ids:
+            evidence = evidence_by_id.get(evidence_id)
+            if evidence is None:
+                continue
+            if audit_at is not None:
+                evidence = evidence_index._available_at(evidence, audit_at)
+                if evidence is None:
+                    continue
+            evidence_states.append(
+                (
+                    evidence_id,
+                    _resource_state_in_evidence(
+                        evidence,
+                        resource.resource_id,
+                        resource.evidence_link_terms,
+                    ),
+                )
             )
-            for evidence_id in resource.evidence_ids
-            if evidence_id in evidence_by_id
-        ]
         states = {state for _, state in evidence_states} - {"UNKNOWN"}
         if resource.resource_id.startswith("data_flow_") and "ACTIVE" in states:
             state = "ACTIVE"
@@ -1013,6 +1302,10 @@ def reconstruct_resource_states(
             evidence = evidence_by_id.get(evidence_id)
             if evidence is None:
                 continue
+            if audit_at is not None:
+                evidence = evidence_index._available_at(evidence, audit_at)
+                if evidence is None:
+                    continue
             metadata.extend(
                 (
                     evidence.captured_at,
@@ -1029,6 +1322,17 @@ def reconstruct_resource_states(
                     )
                     if retention_until is not None or policy_active is not None:
                         metadata.append((evidence.captured_at, retention_until, policy_active))
+                if (
+                    evidence.path.suffix.casefold() == ".pdf"
+                    and _identifier_in_text(evidence.text, resource.resource_id.casefold())
+                ):
+                    retention_until, policy_active = _policy_metadata_from_text(
+                        evidence.text, resource.resource_id
+                    )
+                    if retention_until is not None or policy_active is not None:
+                        metadata.append(
+                            (evidence.captured_at, retention_until, policy_active)
+                        )
             if evidence.path.suffix.casefold() == ".sql":
                 metadata.extend(
                     (evidence.captured_at, retention_until, None)
@@ -1128,7 +1432,9 @@ def investigate_case(
     return CaseInvestigation(
         case_id=case.case_id,
         evidence_ids=tuple(item.file_id for item in evidence),
-        resources=reconstruct_resource_states(resource_observations, evidence_index),
+        resources=reconstruct_resource_states(
+            resource_observations, evidence_index, audit_at=case.audit_at
+        ),
     )
 
 
@@ -1924,7 +2230,7 @@ def extract_image_texts(paths: Iterable[Path]) -> dict[Path, str]:
         raise ContractError(f"missing image OCR helper: {script_path}")
     try:
         result = subprocess.run(
-            [swift, str(script_path), *(str(path) for path in image_paths)],
+            [swift, str(script_path), "images", *(str(path) for path in image_paths)],
             check=True,
             capture_output=True,
             text=True,
@@ -1956,7 +2262,64 @@ def extract_image_texts(paths: Iterable[Path]) -> dict[Path, str]:
     }
 
 
-def extract_evidence_text(path: Path, *, image_text: str = "") -> str:
+def extract_pdf_texts(paths: Iterable[Path]) -> dict[Path, str]:
+    """Extract visible text from PDFs with PDFKit or the optional pypdf package."""
+    pdf_paths = tuple(paths)
+    if not pdf_paths:
+        return {}
+    if sys.platform == "darwin":
+        swift = shutil.which("swift")
+        if swift is None:
+            raise ContractError("PDF extraction on macOS requires the Swift runtime")
+        script_path = Path(__file__).resolve().with_name("image_ocr.swift")
+        if not script_path.is_file():
+            raise ContractError(f"missing PDF extraction helper: {script_path}")
+        try:
+            result = subprocess.run(
+                [swift, str(script_path), "pdfs", *(str(path) for path in pdf_paths)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.strip() or error.stdout.strip() or "no diagnostic output"
+            raise ContractError(f"PDF text extraction failed: {detail}") from error
+        except subprocess.TimeoutExpired as error:
+            raise ContractError("PDF text extraction exceeded the 120-second timeout") from error
+        try:
+            extracted = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ContractError("PDF text extraction returned invalid JSON") from error
+        if (
+            not isinstance(extracted, list)
+            or len(extracted) != len(pdf_paths)
+            or any(not isinstance(text, str) for text in extracted)
+        ):
+            raise ContractError("PDF text extraction returned an invalid result shape")
+        return dict(zip(pdf_paths, extracted))
+
+    try:
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
+    except ImportError as error:
+        raise ContractError(
+            "PDF extraction requires pypdf on platforms without macOS PDFKit"
+        ) from error
+    extracted = {}
+    for path in pdf_paths:
+        try:
+            extracted[path] = "\n".join(
+                page.extract_text() or "" for page in PdfReader(path).pages
+            )
+        except (OSError, PdfReadError, ValueError) as error:
+            raise ContractError(f"{path}: unable to extract PDF text") from error
+    return extracted
+
+
+def extract_evidence_text(
+    path: Path, *, image_text: str = "", pdf_text: str = ""
+) -> str:
     """Extract searchable text from supported participant-facing evidence."""
     suffix = path.suffix.casefold()
     if suffix in TEXT_EVIDENCE_SUFFIXES:
@@ -1967,19 +2330,7 @@ def extract_evidence_text(path: Path, *, image_text: str = "") -> str:
         except json.JSONDecodeError as error:
             raise ContractError(f"{path}: invalid JSON evidence") from error
     if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            # Keep this dependency-free for clean challenge runs.  PDFs with compressed
-            # streams may yield no strings and are then deferred for visual analysis.
-            return subprocess.run(
-                ["strings", "-a", str(path)], check=True, text=True, capture_output=True
-            ).stdout
-        else:
-            try:
-                return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-            except Exception as error:  # pypdf exposes several format-specific exception classes.
-                raise ContractError(f"{path}: unable to extract PDF text") from error
+        return pdf_text
     if suffix == ".png":
         return image_text
     raise ContractError(f"{path}: unsupported evidence type {suffix!r}")
@@ -2020,13 +2371,24 @@ def load_evidence_index(manifest_path: Path, dataset_root: Path = DATASET_ROOT) 
             if path.suffix.casefold() == ".png"
         )
     )
+    pdf_texts = extract_pdf_texts(
+        tuple(
+            path
+            for _, path, _, _ in manifest_entries
+            if path.suffix.casefold() == ".pdf"
+        )
+    )
     files = [
         EvidenceFile(
             file_id=file_id,
             path=path,
             origin=origin,
             captured_at=captured_at,
-            text=extract_evidence_text(path, image_text=image_texts.get(path, "")),
+            text=extract_evidence_text(
+                path,
+                image_text=image_texts.get(path, ""),
+                pdf_text=pdf_texts.get(path, ""),
+            ),
         )
         for file_id, path, origin, captured_at in manifest_entries
     ]
@@ -2240,13 +2602,24 @@ def main() -> int:
                 plan = plan_investigation(case, investigation, load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"))
                 print(f"Planned {plan.case_id}: {plan.deletion_status} with {len(plan.steps)} ordered step(s).")
         if args.diagnose_coverage:
+            evidence_index = load_evidence_index(DATASET_ROOT / "evidence_files.csv")
             diagnostics = diagnose_case_coverage(
                 cases,
                 load_identity_resolver(DATASET_ROOT / "user_identities.csv", DATASET_ROOT / "user_audit_log.csv"),
-                load_evidence_index(DATASET_ROOT / "evidence_files.csv"),
+                evidence_index,
                 load_activity_index(DATASET_ROOT / "system_activity.csv"),
                 load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"),
             )
+            print(
+                "Evidence timestamp conflicts: "
+                f"{len(evidence_index.timestamp_conflicts)} record/event timestamp(s) "
+                "are later than their manifest capture time."
+            )
+            for file_id, resource_id, event_at in evidence_index.timestamp_conflicts:
+                print(
+                    f"  {file_id} resource={resource_id or 'unlinked'} "
+                    f"event_at={event_at.isoformat()}"
+                )
             counts = {
                 outcome: sum(item.outcome == outcome for item in diagnostics)
                 for outcome in ("COMPLETE", "INCOMPLETE", "NOT_APPLICABLE", "BLOCKED", "ERROR")

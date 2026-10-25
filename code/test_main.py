@@ -1,3 +1,5 @@
+import importlib.util
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ from main import (
     load_identity_resolver,
     load_requests,
     extract_image_texts,
+    extract_pdf_texts,
     linked_resource_ids,
     investigate_case,
     orchestrate_case,
@@ -61,7 +64,24 @@ class ImageEvidenceTests(unittest.TestCase):
             text_by_path,
         )
         self.assertEqual(1, run.call_count)
+        self.assertEqual("images", run.call_args.args[0][2])
         self.assertEqual([str(path) for path in paths], run.call_args.args[0][-2:])
+        self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_extracts_pdf_text_with_pdfkit_helper(self):
+        path = Path("retention.pdf")
+        with (
+            patch("main.sys.platform", "darwin"),
+            patch("main.shutil.which", return_value="/usr/bin/swift"),
+            patch(
+                "main.subprocess.run",
+                return_value=Mock(stdout='["signed retention record"]'),
+            ) as run,
+        ):
+            text_by_path = extract_pdf_texts([path])
+
+        self.assertEqual({path: "signed retention record"}, text_by_path)
+        self.assertEqual("pdfs", run.call_args.args[0][2])
         self.assertTrue(run.call_args.kwargs["check"])
 
     def test_image_resource_state_requires_a_visible_identifier(self):
@@ -334,6 +354,106 @@ class ImageEvidenceTests(unittest.TestCase):
 
         self.assertEqual("resource_id=marketing_001", index.files[0].text)
         extract.assert_called_once_with((image_path.resolve(),))
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" or importlib.util.find_spec("pypdf") is not None,
+    "PDF text extraction requires macOS PDFKit or pypdf",
+)
+class PointInTimeEvidenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cases = {
+            case.case_id: case
+            for case in load_requests(DATASET / "deletion_requests.csv")
+        }
+        cls.identity_resolver = load_identity_resolver(
+            DATASET / "user_identities.csv", DATASET / "user_audit_log.csv"
+        )
+        cls.evidence_index = load_evidence_index(
+            DATASET / "evidence_files.csv", DATASET
+        )
+        cls.activity_index = load_activity_index(DATASET / "system_activity.csv")
+        cls.rules = load_deletion_rules(DATASET / "deletion_rules.csv")
+
+    def test_case_45_uses_signed_pdf_retention_evidence(self):
+        case = self.cases["case_45"]
+        identity = self.identity_resolver.resolve(case.email, case.case_id)
+        investigation = investigate_case(
+            case, identity, self.evidence_index, self.activity_index
+        )
+        audit_record = next(
+            resource
+            for resource in investigation.resources
+            if resource.resource_id == "audit_record_003"
+        )
+        pdf_evidence = next(
+            evidence
+            for evidence in self.evidence_index.files
+            if evidence.file_id == "evidence_55"
+        )
+
+        self.assertIn("retain until 25 Aug 2027 04 03 UTC", pdf_evidence.text)
+        self.assertEqual("PRESENT", audit_record.observed_state)
+        self.assertEqual(
+            datetime(2027, 8, 25, 4, 3, tzinfo=timezone.utc),
+            audit_record.retention_until,
+        )
+        diagnostic = diagnose_case_coverage(
+            [case],
+            self.identity_resolver,
+            self.evidence_index,
+            self.activity_index,
+            self.rules,
+        )[0]
+        self.assertEqual("COMPLETE", diagnostic.outcome)
+
+    def test_future_dated_json_records_do_not_change_case_state(self):
+        targets = (
+            ("case_135", "account_1417", "evidence_13", "2026-08-14T09:00:00Z"),
+            ("case_383", "account_5043", "evidence_36", "2026-04-11T12:00:00Z"),
+        )
+        for case_id, resource_id, file_id, future_timestamp in targets:
+            with self.subTest(case_id=case_id):
+                case = self.cases[case_id]
+                evidence = next(
+                    item
+                    for item in self.evidence_index.files
+                    if item.file_id == file_id
+                )
+                available = self.evidence_index._available_at(
+                    evidence, case.audit_at
+                )
+                self.assertIsNotNone(available)
+                self.assertNotIn(future_timestamp, available.text)
+
+                identity = self.identity_resolver.resolve(case.email, case.case_id)
+                investigation = investigate_case(
+                    case, identity, self.evidence_index, self.activity_index
+                )
+                resource = next(
+                    item
+                    for item in investigation.resources
+                    if item.resource_id == resource_id
+                )
+                self.assertEqual("ABSENT", resource.observed_state)
+                self.assertEqual((file_id,), resource.state_evidence_ids)
+
+    def test_timestamp_conflicts_are_reported_for_future_dated_records(self):
+        conflicts = {
+            (file_id, resource_id, event_at.isoformat())
+            for file_id, resource_id, event_at
+            in self.evidence_index.timestamp_conflicts
+        }
+
+        self.assertIn(
+            ("evidence_13", "account_1417", "2026-08-14T09:00:00+00:00"),
+            conflicts,
+        )
+        self.assertIn(
+            ("evidence_36", "account_5043", "2026-04-11T12:00:00+00:00"),
+            conflicts,
+        )
 
 
 class ContractTests(unittest.TestCase):
