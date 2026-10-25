@@ -166,6 +166,8 @@ class CaseCoverageDiagnostic:
     reason_code: str = ""
     resource_id: str = ""
     evidence_ids: tuple[str, ...] = ()
+    evidence_assessment: str = ""
+    evidence_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1095,43 @@ def _missing_evidence_reason(error: ContractError) -> tuple[str, str] | None:
     return None
 
 
+def _diagnostic_evidence_assessment(
+    resource_id: str, evidence_files: Iterable[EvidenceFile]
+) -> tuple[str, str]:
+    files = tuple(evidence_files)
+    if not files:
+        return (
+            "NO_RESOURCE_EVIDENCE",
+            "No participant-facing evidence file captured by audit_at references this resource.",
+        )
+
+    matching_lines = [
+        line.casefold()
+        for evidence in files
+        for line in evidence.text.splitlines()
+        if _identifier_in_text(line, resource_id.casefold())
+    ]
+    if resource_id.startswith("support_") and any(
+        "support_ticket_read_completed" in line
+        and all(
+            re.search(rf"\brequester_{field}\s*=\s*null\b", line)
+            for field in ("name", "email", "phone")
+        )
+        and not re.search(r"\bmessage_text\s*=", line)
+        for line in matching_lines
+    ):
+        return (
+            "PARTIAL_SUPPORT_READBACK",
+            "A support readback records null requester identifiers, but omits message content; "
+            "the required redaction cannot be verified.",
+        )
+    return (
+        "RESOURCE_EVIDENCE_WITHOUT_STATE_SIGNAL",
+        "Participant-facing evidence references this resource, but contains no supported state "
+        "signal for the required decision.",
+    )
+
+
 def diagnose_case_coverage(
     cases: Iterable[AuditCase],
     identity_resolver: IdentityResolver,
@@ -1133,6 +1172,12 @@ def diagnose_case_coverage(
                 if resource_id
                 else ()
             )
+            evidence_assessment, evidence_note = ("", "")
+            if reason_code == "UNKNOWN_RESOURCE_STATE" and resource_id:
+                evidence_assessment, evidence_note = _diagnostic_evidence_assessment(
+                    resource_id,
+                    evidence_index.for_resource(resource_id, case.audit_at),
+                )
             diagnostics.append(
                 CaseCoverageDiagnostic(
                     case.case_id,
@@ -1141,6 +1186,8 @@ def diagnose_case_coverage(
                     reason_code,
                     resource_id,
                     evidence_ids,
+                    evidence_assessment,
+                    evidence_note,
                 )
             )
         else:
@@ -1795,8 +1842,11 @@ def main() -> int:
                         )
                         print(
                             f"  {item.case_id}:{resources} evidence={evidence} "
+                            f"assessment={item.evidence_assessment or 'not applicable'} "
                             f"reason={item.reason}"
                         )
+                        if item.evidence_note:
+                            print(f"    evidence note: {item.evidence_note}")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

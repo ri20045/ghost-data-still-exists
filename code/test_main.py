@@ -95,6 +95,52 @@ class ContractTests(unittest.TestCase):
             diagnostics,
         )
 
+    def test_coverage_diagnostic_distinguishes_partial_support_evidence(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please delete my account.",
+            )
+            for index in range(1, 3)
+        ]
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_support_readback",
+                    Path("support.log"),
+                    "test_fixture",
+                    audit_at,
+                    "2026-01-03T00:00:00Z service=support_platform "
+                    "event=support_ticket_read_completed resource_id=support_001 "
+                    "requester_name=null requester_email=null requester_phone=null",
+                )
+            ]
+        )
+        with patch(
+            "main.orchestrate_case",
+            side_effect=[
+                ContractError("case_1: resource support_001 state is unknown"),
+                ContractError("case_2: resource export_002 state is unknown"),
+            ],
+        ):
+            diagnostics = diagnose_case_coverage(
+                cases, Mock(), evidence_index, ActivityIndex([]), []
+            )
+
+        self.assertEqual(["BLOCKED", "BLOCKED"], [item.outcome for item in diagnostics])
+        self.assertEqual(
+            ["PARTIAL_SUPPORT_READBACK", "NO_RESOURCE_EVIDENCE"],
+            [item.evidence_assessment for item in diagnostics],
+        )
+        self.assertIn("omits message content", diagnostics[0].evidence_note)
+        self.assertIn("No participant-facing evidence", diagnostics[1].evidence_note)
+
     def test_loads_and_sorts_all_evaluation_requests(self):
         cases = load_requests(DATASET / "deletion_requests.csv")
         self.assertEqual(518, len(cases))

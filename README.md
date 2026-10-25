@@ -70,7 +70,7 @@ python3 code/main.py --requests dataset/sample_deletion_requests.csv --diagnose-
 python3 -m unittest discover -s code -p 'test_*.py'
 ```
 
-`--diagnose-coverage` summarizes cases that can be planned, are not deletion requests, are blocked by missing identity/evidence, or encounter a separate processing error. Blocked/error cases are grouped by root cause; where an unresolved resource ID is known, the report includes that ID and the participant-facing evidence file IDs captured by `audit_at`. A displayed evidence ID is a lead for review, not a claim that it contains the missing fact. The diagnostic does not create or modify `output.csv`.
+`--diagnose-coverage` summarizes cases that can be planned, are not deletion requests, are blocked by missing identity/evidence, or encounter a separate processing error. Blocked/error cases are grouped by root cause; where an unresolved resource ID is known, the report includes that ID and the participant-facing evidence file IDs captured by `audit_at`. Unknown-state cases distinguish no resource evidence from evidence without a usable state signal, and flag support readbacks that show null requester fields but omit the message content needed to verify redaction. A displayed evidence ID is a lead for review, not a claim that it proves the required state. The diagnostic does not create or modify `output.csv`.
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
