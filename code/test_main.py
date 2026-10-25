@@ -12,6 +12,7 @@ from main import (
     ContractError,
     DeletionRule,
     diagnose_case_coverage,
+    require_output_eligible_coverage,
     EvidenceFile,
     EvidenceIndex,
     OutputRow,
@@ -37,6 +38,27 @@ DATASET = ROOT / "dataset"
 
 
 class ContractTests(unittest.TestCase):
+    def test_output_coverage_gate_allows_only_contract_statuses(self):
+        require_output_eligible_coverage(
+            (
+                CaseCoverageDiagnostic("case_complete", "COMPLETE"),
+                CaseCoverageDiagnostic("case_incomplete", "INCOMPLETE"),
+                CaseCoverageDiagnostic("case_n_a", "NOT_APPLICABLE"),
+            )
+        )
+
+    def test_output_coverage_gate_rejects_blocked_and_processing_error_cases(self):
+        with self.assertRaisesRegex(
+            ContractError,
+            r"2 case\(s\).*1 BLOCKED, 1 ERROR.*case_blocked, case_error",
+        ):
+            require_output_eligible_coverage(
+                (
+                    CaseCoverageDiagnostic("case_blocked", "BLOCKED"),
+                    CaseCoverageDiagnostic("case_error", "ERROR"),
+                )
+            )
+
     def test_coverage_diagnostic_separates_blocked_cases_from_errors(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         cases = [

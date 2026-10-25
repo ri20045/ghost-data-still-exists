@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1279,6 +1279,25 @@ def diagnose_case_coverage(
     return tuple(diagnostics)
 
 
+def require_output_eligible_coverage(diagnostics: Iterable[CaseCoverageDiagnostic]) -> None:
+    """Fail closed when any case cannot receive a contract-valid deletion status."""
+    unresolved = [
+        item for item in diagnostics
+        if item.outcome not in VALID_STATUSES
+    ]
+    if unresolved:
+        counts = Counter(item.outcome for item in unresolved)
+        cases = ", ".join(item.case_id for item in unresolved[:5])
+        more = f", and {len(unresolved) - 5} more" if len(unresolved) > 5 else ""
+        summary = ", ".join(
+            f"{count} {outcome}" for outcome, count in sorted(counts.items())
+        )
+        raise ContractError(
+            f"output generation is unsafe: {len(unresolved)} case(s) have no "
+            f"contract-valid deletion status ({summary}); unresolved cases: {cases}{more}"
+        )
+
+
 def make_step(
     phase: str, system_id: str, resource_id: str, operation: str, state: str, evidence_id: str
 ) -> dict[str, Any]:
@@ -1858,7 +1877,15 @@ def main() -> int:
         action="store_true",
         help="summarize resolved, non-deletion, and evidence-blocked cases without writing output",
     )
+    parser.add_argument(
+        "--require-resolved-coverage",
+        action="store_true",
+        help="fail unless every request has a contract-valid status (requires --diagnose-coverage)",
+    )
     args = parser.parse_args()
+
+    if args.require_resolved_coverage and not args.diagnose_coverage:
+        parser.error("--require-resolved-coverage requires --diagnose-coverage")
 
     try:
         cases = load_requests(args.requests)
@@ -1931,6 +1958,8 @@ def main() -> int:
                             print(f"    evidence note: {item.evidence_note}")
                         if item.evidence_needed:
                             print(f"    evidence needed: {item.evidence_needed}")
+            if args.require_resolved_coverage:
+                require_output_eligible_coverage(diagnostics)
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:
