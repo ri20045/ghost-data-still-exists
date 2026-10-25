@@ -368,7 +368,7 @@ def _resource_ids_in_evidence(evidence: EvidenceFile) -> set[str]:
 
 
 def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> set[str]:
-    """Find resources in the same evidence record or line as a subject identifier."""
+    """Find resources linked to a subject within the same evidence or trace."""
     needles = {value.casefold() for value in identifiers if value.strip()}
     if not needles:
         return set()
@@ -406,6 +406,19 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
         if any(_identifier_in_text(line, needle) for needle in needles)
         for resource_id in RESOURCE_ID_PATTERN.findall(line)
     }
+    subject_correlations = {
+        correlation_id
+        for line in evidence.text.splitlines()
+        if any(_identifier_in_text(line, needle) for needle in needles)
+        for correlation_id in _log_correlation_ids(line)
+    }
+    if subject_correlations:
+        found.update(
+            resource_id
+            for line in evidence.text.splitlines()
+            if subject_correlations.intersection(_log_correlation_ids(line))
+            for resource_id in RESOURCE_ID_PATTERN.findall(line)
+        )
     if evidence.path.suffix.casefold() == ".png" and not found:
         image_resources = _resource_ids_in_evidence(evidence)
         if len(image_resources) == 1 and any(
@@ -413,6 +426,18 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
         ):
             found.update(image_resources)
     return found
+
+
+def _log_correlation_ids(line: str) -> set[str]:
+    correlation_ids = set(
+        re.findall(
+            r"\b(?:trace_id|request_id|requestId)\s*[=:]\s*[\"']?([\w-]+)",
+            line,
+            re.IGNORECASE,
+        )
+    )
+    correlation_ids.update(re.findall(r"\btr-\d+\b", line, re.IGNORECASE))
+    return correlation_ids
 
 
 def _identifier_in_text(text: str, identifier: str) -> bool:

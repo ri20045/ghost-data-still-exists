@@ -1390,3 +1390,25 @@ branch=main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=/Users/riyarawat/hackerrank-orchestrate-october26
 parent_agent=none
+## [2026-10-25T11:12:30Z] Correlating trace-linked resource evidence
+
+User Prompt (verbatim, secrets redacted):
+yes now finish it one go and generate output when resolved the blocked cases
+
+Agent Response Summary:
+Added trace/request-ID correlation for log evidence so subject-linked start events can be joined to resource-specific readbacks, while retaining the per-case `audit_at` cutoff. This resolved unlinked-resource diagnostics but exposed audit records without the retention cutoffs required by policy; evidence does not support resolving those or the remaining unknown states. The fail-closed pipeline still reports blocked cases, so no root `output.csv` was generated.
+
+Actions:
+* Updated README.md, code/main.py, and code/test_main.py with correlated log linking and cutoff regressions.
+* Ran `python3 -m unittest discover -s code -p 'test_*.py'` (66 passed) and `python3 -m unittest discover -s evaluation -p 'test_*.py'` (3 passed).
+* Ran `swiftc -typecheck code/image_ocr.swift`, `python3 -m py_compile code/main.py code/test_main.py`, and `git diff --check` (passed).
+* Ran `python3 code/main.py --diagnose-coverage`: 518 requests; 75 COMPLETE, 216 INCOMPLETE, 10 NOT_APPLICABLE, 217 BLOCKED, 0 ERROR. The 11 formerly unlinked cases now identify audit records, but remain blocked by missing retention cutoffs.
+* Confirmed `output.csv` remains absent; did not stage, commit, push, or otherwise perform Git write operations.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none

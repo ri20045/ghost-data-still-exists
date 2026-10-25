@@ -940,6 +940,61 @@ class ContractTests(unittest.TestCase):
             item.file_id for item in index.search(["user_437"], captured_at)
         ])
 
+    def test_links_log_resources_through_structured_trace_identifiers(self):
+        evidence = EvidenceFile(
+            "evidence_correlated_log",
+            Path("runtime.log"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            (
+                '2026-01-03T00:00:00Z requestId=tr-101 '
+                'event=profile_lookup_started lookup_key="person@example.test"\n'
+                '2026-01-03T00:00:01Z requestId=tr-101 '
+                'resource_id=account_101 event=profile_lookup_completed rows="0"\n'
+                '2026-01-03T00:00:02Z {"trace_id":"tr-102",'
+                '"event":"index_query_started","match_key":"person@example.test"}\n'
+                '2026-01-03T00:00:03Z {"trace_id":"tr-102",'
+                '"resource_id":"search_102","event":"index_query_completed",'
+                '"result":"hit"}\n'
+                '2026-01-03T00:00:04Z <15>1 node-1 account_service tr-103 - - '
+                'event=profile_lookup_started lookup_key="person@example.test"\n'
+                '2026-01-03T00:00:05Z <14>1 node-1 account_service tr-103 - - '
+                'resource_id=account_103 event=profile_lookup_completed rows="1"\n'
+                '2026-01-03T00:00:06Z | DEBUG | search_service | tr-104 | '
+                'index_query_started | match_key="person@example.test"\n'
+                '2026-01-03T00:00:07Z | INFO | search_service | tr-104 | '
+                'resource_id=search_104 | index_query_completed | result="hit"\n'
+                '2026-01-03T00:00:08Z requestId=tr-999 '
+                'resource_id=account_999 event=profile_lookup_completed rows="1"'
+            ),
+        )
+
+        self.assertEqual(
+            {"account_101", "search_102", "account_103", "search_104"},
+            linked_resource_ids(evidence, ("person@example.test",)),
+        )
+
+    def test_log_trace_correlation_does_not_use_future_readbacks(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_future_correlated_log",
+            Path("runtime.log"),
+            "test_fixture",
+            audit_at,
+            (
+                "2026-01-03T00:00:00Z requestId=tr-101 "
+                "event=profile_lookup_started lookup_key=person@example.test\n"
+                "2026-01-04T00:00:00Z requestId=tr-101 "
+                "resource_id=account_101 event=profile_lookup_completed rows=0"
+            ),
+        )
+        available = EvidenceIndex([evidence]).search(
+            ("person@example.test",), audit_at
+        )
+
+        self.assertEqual(1, len(available))
+        self.assertEqual(set(), linked_resource_ids(available[0], ("person@example.test",)))
+
     def test_activity_identity_link_discovers_resource_but_evidence_proves_state(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         case = AuditCase(
