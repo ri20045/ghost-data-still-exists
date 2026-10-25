@@ -83,6 +83,8 @@ class ContractTests(unittest.TestCase):
                     "UNKNOWN_RETENTION_CUTOFF",
                     "audit_record_002",
                     ("evidence_retention_row",),
+                    "RESOURCE_EVIDENCE_WITHOUT_AUDIT_METADATA",
+                    "Evidence references the resource but does not establish an audit-record cutoff.",
                 ),
                 CaseCoverageDiagnostic(
                     "case_3",
@@ -140,6 +142,62 @@ class ContractTests(unittest.TestCase):
         )
         self.assertIn("omits message content", diagnostics[0].evidence_note)
         self.assertIn("No participant-facing evidence", diagnostics[1].evidence_note)
+
+    def test_coverage_diagnostic_distinguishes_missing_retention_cutoff_evidence(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please delete my account.",
+            )
+            for index in range(1, 4)
+        ]
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_audit_record",
+                    Path("audit.json"),
+                    "test_fixture",
+                    audit_at,
+                    '{"resource_id":"audit_record_001","event_code":"SUBJECT_REQUEST_AUDITED"}',
+                ),
+                EvidenceFile(
+                    "evidence_resource_only",
+                    Path("audit.json"),
+                    "test_fixture",
+                    audit_at,
+                    '{"resource_id":"audit_record_002","source":"security_service"}',
+                ),
+            ]
+        )
+        with patch(
+            "main.orchestrate_case",
+            side_effect=[
+                ContractError("case_1: retention cutoff is unknown for audit_record_001"),
+                ContractError("case_2: retention cutoff is unknown for audit_record_002"),
+                ContractError("case_3: retention cutoff is unknown for audit_record_003"),
+            ],
+        ):
+            diagnostics = diagnose_case_coverage(
+                cases, Mock(), evidence_index, ActivityIndex([]), []
+            )
+
+        self.assertEqual(
+            [
+                "AUDIT_RECORD_WITHOUT_CUTOFF",
+                "RESOURCE_EVIDENCE_WITHOUT_AUDIT_METADATA",
+                "NO_AUDIT_RECORD_EVIDENCE",
+            ],
+            [item.evidence_assessment for item in diagnostics],
+        )
+        self.assertTrue(
+            all(item.outcome == "BLOCKED" for item in diagnostics)
+        )
 
     def test_loads_and_sorts_all_evaluation_requests(self):
         cases = load_requests(DATASET / "deletion_requests.csv")

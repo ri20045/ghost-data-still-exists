@@ -1132,6 +1132,58 @@ def _diagnostic_evidence_assessment(
     )
 
 
+def _diagnostic_retention_assessment(
+    resource_id: str, evidence_files: Iterable[EvidenceFile]
+) -> tuple[str, str]:
+    files = tuple(evidence_files)
+    if not files:
+        return (
+            "NO_AUDIT_RECORD_EVIDENCE",
+            "No participant-facing evidence captured by audit_at references this audit record.",
+        )
+
+    audit_record_found = False
+    for evidence in files:
+        records = _records_in_evidence(evidence, resource_id)
+        if any(record.get("event_name") or record.get("event_code") for record in records):
+            audit_record_found = True
+        if evidence.path.suffix.casefold() == ".sql":
+            if _policy_metadata_from_sql(evidence.text, resource_id):
+                return (
+                    "CUTOFF_PRESENT_UNRESOLVED",
+                    "Evidence contains an explicit retention cutoff, but the case is still blocked; "
+                    "review the conflicting evidence and parser result.",
+                )
+            if re.search(
+                rf"\bINSERT\s+INTO\s+[\"`\[]?security_audit_records[\"`\]]?"
+                rf"\s*(?:\([^)]*\))?\s+VALUES\s*\([^;\n]*{re.escape(resource_id)}",
+                evidence.text,
+                re.IGNORECASE,
+            ):
+                audit_record_found = True
+        for line in evidence.text.splitlines():
+            if not _identifier_in_text(line, resource_id.casefold()):
+                continue
+            if re.search(r"\b(?:event_name|event_code)\s*[=:]", line, re.IGNORECASE):
+                audit_record_found = True
+            if _policy_metadata_from_text(line, resource_id)[0] is not None:
+                return (
+                    "CUTOFF_PRESENT_UNRESOLVED",
+                    "Evidence contains an explicit retention cutoff, but the case is still blocked; "
+                    "review the conflicting evidence and parser result.",
+                )
+
+    if audit_record_found:
+        return (
+            "AUDIT_RECORD_WITHOUT_CUTOFF",
+            "Evidence establishes the audit record, but does not supply its retention cutoff.",
+        )
+    return (
+        "RESOURCE_EVIDENCE_WITHOUT_AUDIT_METADATA",
+        "Evidence references the resource but does not establish an audit-record cutoff.",
+    )
+
+
 def diagnose_case_coverage(
     cases: Iterable[AuditCase],
     identity_resolver: IdentityResolver,
@@ -1175,6 +1227,11 @@ def diagnose_case_coverage(
             evidence_assessment, evidence_note = ("", "")
             if reason_code == "UNKNOWN_RESOURCE_STATE" and resource_id:
                 evidence_assessment, evidence_note = _diagnostic_evidence_assessment(
+                    resource_id,
+                    evidence_index.for_resource(resource_id, case.audit_at),
+                )
+            elif reason_code == "UNKNOWN_RETENTION_CUTOFF" and resource_id:
+                evidence_assessment, evidence_note = _diagnostic_retention_assessment(
                     resource_id,
                     evidence_index.for_resource(resource_id, case.audit_at),
                 )
