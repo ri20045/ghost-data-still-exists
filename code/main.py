@@ -393,6 +393,12 @@ def _resource_state_from_result(result: str, resource_id: str) -> str:
 
 def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: bool = False) -> str:
     normalized = text.replace('\\"', '"').casefold()
+    if resource_id.startswith("search_"):
+        total_hits = re.search(
+            r"\btotal_hits[\"']?\s*[:=]\s*[\"']?(\d+)", normalized
+        )
+        if total_hits:
+            return "PRESENT" if int(total_hits.group(1)) > 0 else "ABSENT"
     if resource_id.startswith("data_flow_"):
         if re.search(
             r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
@@ -687,6 +693,12 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
     http_status = record.get("status_code", record.get("http_status"))
     if str(http_status).isdigit() and int(str(http_status)) == 404:
         return "ABSENT"
+    total_hits = record.get("total_hits")
+    if resource_id.startswith("search_") and (
+        isinstance(total_hits, int) and not isinstance(total_hits, bool)
+        or isinstance(total_hits, str) and total_hits.isdigit()
+    ):
+        return "PRESENT" if int(total_hits) > 0 else "ABSENT"
     if has_identifier(record):
         return "PRESENT"
     message_text = record.get("message_text")

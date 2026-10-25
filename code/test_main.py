@@ -675,7 +675,11 @@ class ContractTests(unittest.TestCase):
                 '2026-01-03T00:00:06Z {"resource_id":"account_002",'
                 '"event":"profile_lookup_completed","rows":"0","http_status":"404"}\n'
                 '2026-01-03T00:00:07Z {"resource_id":"account_003",'
-                '"event":"profile_lookup_completed","rows":"1","http_status":"200"}'
+                '"event":"profile_lookup_completed","rows":"1","http_status":"200"}\n'
+                '2026-01-03T00:00:08Z {"resource_id":"search_002",'
+                '"event":"index_query_completed","total_hits":0}\n'
+                '2026-01-03T00:00:09Z {"resource_id":"search_003",'
+                '"event":"index_query_completed","total_hits":2}'
             ),
         )
         resource_ids = (
@@ -687,6 +691,8 @@ class ContractTests(unittest.TestCase):
             "export_001",
             "account_002",
             "account_003",
+            "search_002",
+            "search_003",
         )
         resources = reconstruct_resource_states(
             [
@@ -706,7 +712,33 @@ class ContractTests(unittest.TestCase):
                 "PRESENT",
                 "ABSENT",
                 "PRESENT",
+                "ABSENT",
+                "PRESENT",
             ],
+            [resource.observed_state for resource in resources],
+        )
+
+    def test_reconstructs_search_state_from_text_hit_counts(self):
+        evidence = EvidenceFile(
+            "evidence_search_counts",
+            Path("search.log"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            (
+                '2026-01-03T00:00:00Z resource_id=search_010 total_hits="0"\n'
+                '2026-01-03T00:00:01Z resource_id=search_011 total_hits="3"'
+            ),
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_search_counts",), (), None, "UNKNOWN", ())
+                for resource_id in ("search_010", "search_011")
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["ABSENT", "PRESENT"],
             [resource.observed_state for resource in resources],
         )
 
