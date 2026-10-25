@@ -69,11 +69,15 @@ python3 code/main.py --diagnose-coverage
 python3 code/main.py --generate-output output.csv
 python3 code/main.py --requests dataset/sample_deletion_requests.csv --diagnose-coverage
 python3 -m unittest discover -s code -p 'test_*.py'
+python3 -m unittest discover -s evaluation -p 'test_*.py'
+python3 evaluation/evaluate.py path/to/sample_prediction.csv
 ```
 
 `--diagnose-coverage` summarizes cases that can be planned, are not deletion requests, are blocked by missing identity/evidence, or encounter a separate processing error. Blocked/error cases are grouped by root cause; where an unresolved resource ID is known, the report includes that ID and the participant-facing evidence file IDs captured by `audit_at`. Unknown-state cases distinguish no resource evidence from evidence without a usable state signal, and flag support readbacks that show null requester fields but omit the message content needed to verify redaction. Unknown-retention cases distinguish an audit record lacking its required cutoff from resource-only evidence or no resource evidence, and state what participant-facing evidence is needed to resolve each case. A displayed evidence ID is a lead for review, not a claim that it proves the required state. The diagnostic does not create or modify `output.csv`.
 
 `--require-resolved-coverage` can be combined with `--diagnose-coverage` to enforce fail-closed output eligibility. `BLOCKED` and `ERROR` are internal diagnostic outcomes, not deletion statuses allowed by the CSV contract; if any request has either outcome, the command exits with an error instead of allowing an incomplete or fabricated output. Without that flag, coverage diagnosis remains informational and exits normally.
+
+The evaluation helper compares a candidate CSV to the public sample answers and reports status, step, field, and sequence metrics plus case-ID integrity. Evaluation and usage reports are in [`evaluation/`](./evaluation/); they distinguish unavailable final-run metrics from measured results while the fail-closed batch is unresolved.
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
