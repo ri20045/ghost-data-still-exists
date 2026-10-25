@@ -25,6 +25,7 @@ from main import (
     load_requests,
     investigate_case,
     orchestrate_case,
+    orchestrate_cases,
     plan_investigation,
     reconstruct_resource_states,
     request_authorizes_deletion,
@@ -58,6 +59,60 @@ class ContractTests(unittest.TestCase):
                     CaseCoverageDiagnostic("case_error", "ERROR"),
                 )
             )
+
+    def test_batch_orchestration_returns_rows_in_input_order(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please provide a copy of my account data.",
+            )
+            for index in range(1, 3)
+        ]
+        expected_rows = [
+            OutputRow("case_1", "NOT_APPLICABLE", []),
+            OutputRow("case_2", "NOT_APPLICABLE", []),
+        ]
+        with patch("main.orchestrate_case", side_effect=expected_rows) as orchestrate:
+            rows = orchestrate_cases(cases, Mock(), Mock(), Mock(), [])
+
+        self.assertEqual(expected_rows, rows)
+        self.assertEqual(2, orchestrate.call_count)
+
+    def test_batch_orchestration_fails_without_returning_partial_rows(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please delete my account.",
+            )
+            for index in range(1, 4)
+        ]
+        with patch(
+            "main.orchestrate_case",
+            side_effect=[
+                OutputRow("case_1", "NOT_APPLICABLE", []),
+                ContractError("case_2: retention cutoff is unknown for audit_record_002"),
+                OutputRow("case_3", "NOT_APPLICABLE", []),
+            ],
+        ) as orchestrate:
+            with self.assertRaisesRegex(
+                ContractError,
+                r"batch planning aborted: 1 case.*1 BLOCKED.*case_2",
+            ):
+                orchestrate_cases(cases, Mock(), Mock(), Mock(), [])
+
+        self.assertEqual(3, orchestrate.call_count)
 
     def test_coverage_diagnostic_separates_blocked_cases_from_errors(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)

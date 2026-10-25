@@ -1076,6 +1076,48 @@ def orchestrate_case(
     return plan_investigation(case, investigation, rules)
 
 
+def orchestrate_cases(
+    cases: Iterable[AuditCase],
+    identity_resolver: IdentityResolver,
+    evidence_index: EvidenceIndex,
+    activity_index: ActivityIndex,
+    rules: Iterable[DeletionRule],
+) -> list[OutputRow]:
+    """Build a validated batch of rows, failing without returning partial output."""
+    ordered_cases = list(cases)
+    rules_list = list(rules)
+    rows = []
+    failures: list[tuple[str, str]] = []
+    for case in ordered_cases:
+        try:
+            rows.append(
+                orchestrate_case(
+                    case, identity_resolver, evidence_index, activity_index, rules_list
+                )
+            )
+        except ContractError as error:
+            category = (
+                "BLOCKED"
+                if _missing_evidence_reason(error) is not None
+                else "ERROR"
+            )
+            failures.append((case.case_id, category))
+
+    if failures:
+        counts = Counter(category for _, category in failures)
+        summary = ", ".join(
+            f"{count} {category}" for category, count in sorted(counts.items())
+        )
+        case_ids = ", ".join(case_id for case_id, _ in failures[:10])
+        more = f", and {len(failures) - 10} more" if len(failures) > 10 else ""
+        raise ContractError(
+            f"batch planning aborted: {len(failures)} case(s) are unresolved "
+            f"({summary}); no batch rows returned. Cases: {case_ids}{more}"
+        )
+
+    return validate_output_rows(ordered_cases, rows)
+
+
 def _missing_evidence_reason(error: ContractError) -> tuple[str, str] | None:
     message = str(error)
     normalized = message.casefold()
