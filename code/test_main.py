@@ -85,6 +85,7 @@ class ContractTests(unittest.TestCase):
                     ("evidence_retention_row",),
                     "RESOURCE_EVIDENCE_WITHOUT_AUDIT_METADATA",
                     "Evidence references the resource but does not establish an audit-record cutoff.",
+                    "Participant-facing evidence linking this resource to its audit event and retention_until cutoff.",
                 ),
                 CaseCoverageDiagnostic(
                     "case_3",
@@ -195,6 +196,12 @@ class ContractTests(unittest.TestCase):
             ],
             [item.evidence_assessment for item in diagnostics],
         )
+        self.assertIn(
+            "retention schedule explicitly applicable",
+            diagnostics[0].evidence_needed,
+        )
+        self.assertIn("retention_until cutoff", diagnostics[1].evidence_needed)
+        self.assertIn("captured by audit_at", diagnostics[2].evidence_needed)
         self.assertTrue(
             all(item.outcome == "BLOCKED" for item in diagnostics)
         )

@@ -168,6 +168,7 @@ class CaseCoverageDiagnostic:
     evidence_ids: tuple[str, ...] = ()
     evidence_assessment: str = ""
     evidence_note: str = ""
+    evidence_needed: str = ""
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1185,27 @@ def _diagnostic_retention_assessment(
     )
 
 
+def _retention_evidence_needed(assessment: str) -> str:
+    if assessment == "AUDIT_RECORD_WITHOUT_CUTOFF":
+        return (
+            "Authoritative retention_until for this resource, or a participant-facing "
+            "retention schedule explicitly applicable to its audit event."
+        )
+    if assessment == "RESOURCE_EVIDENCE_WITHOUT_AUDIT_METADATA":
+        return (
+            "Participant-facing evidence linking this resource to its audit event and "
+            "retention_until cutoff."
+        )
+    if assessment == "NO_AUDIT_RECORD_EVIDENCE":
+        return (
+            "Participant-facing evidence captured by audit_at that identifies this audit "
+            "record and supplies its retention cutoff."
+        )
+    if assessment == "CUTOFF_PRESENT_UNRESOLVED":
+        return "Clarification reconciling the explicit retention cutoff evidence for this resource."
+    return ""
+
+
 def diagnose_case_coverage(
     cases: Iterable[AuditCase],
     identity_resolver: IdentityResolver,
@@ -1225,6 +1247,7 @@ def diagnose_case_coverage(
                 else ()
             )
             evidence_assessment, evidence_note = ("", "")
+            evidence_needed = ""
             if reason_code == "UNKNOWN_RESOURCE_STATE" and resource_id:
                 evidence_assessment, evidence_note = _diagnostic_evidence_assessment(
                     resource_id,
@@ -1235,6 +1258,7 @@ def diagnose_case_coverage(
                     resource_id,
                     evidence_index.for_resource(resource_id, case.audit_at),
                 )
+                evidence_needed = _retention_evidence_needed(evidence_assessment)
             diagnostics.append(
                 CaseCoverageDiagnostic(
                     case.case_id,
@@ -1245,6 +1269,7 @@ def diagnose_case_coverage(
                     evidence_ids,
                     evidence_assessment,
                     evidence_note,
+                    evidence_needed,
                 )
             )
         else:
@@ -1904,6 +1929,8 @@ def main() -> int:
                         )
                         if item.evidence_note:
                             print(f"    evidence note: {item.evidence_note}")
+                        if item.evidence_needed:
+                            print(f"    evidence needed: {item.evidence_needed}")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:
