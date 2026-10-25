@@ -24,6 +24,7 @@ from main import (
     load_deletion_rules,
     load_identity_resolver,
     load_requests,
+    extract_image_texts,
     investigate_case,
     orchestrate_case,
     orchestrate_cases,
@@ -39,6 +40,169 @@ from main import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET = ROOT / "dataset"
+
+
+class ImageEvidenceTests(unittest.TestCase):
+    def test_extracts_all_image_text_in_one_vision_invocation(self):
+        paths = [Path("first.png"), Path("second.png")]
+        with (
+            patch("main.sys.platform", "darwin"),
+            patch("main.shutil.which", return_value="/usr/bin/swift"),
+            patch(
+                "main.subprocess.run",
+                return_value=Mock(stdout='[["first line"],["second","line"]]'),
+            ) as run,
+        ):
+            text_by_path = extract_image_texts(paths)
+
+        self.assertEqual(
+            {paths[0]: "first line", paths[1]: "second\nline"},
+            text_by_path,
+        )
+        self.assertEqual(1, run.call_count)
+        self.assertEqual([str(path) for path in paths], run.call_args.args[0][-2:])
+        self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_image_resource_state_requires_a_visible_identifier(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_image",
+            Path("screenshot.png"),
+            "test_fixture",
+            audit_at,
+            "marketing_001 • person@example.test",
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(
+                    "marketing_001", ("evidence_image",), (), None, "UNKNOWN", ()
+                )
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual("PRESENT", resources[0].observed_state)
+
+    def test_unrelated_profile_screenshot_does_not_confirm_activity_lead(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_image_lead",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        identity = ResolvedIdentity(
+            "user_001",
+            {"name": "", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_image",
+                    Path("screenshot.png"),
+                    "test_fixture",
+                    audit_at,
+                    "marketing_001 • another@example.test",
+                )
+            ]
+        )
+        activity_index = ActivityIndex(
+            [
+                ActivityEvent(
+                    "activity_lead",
+                    audit_at,
+                    "LINK_RESOURCE_IDENTITY",
+                    "data_catalog",
+                    "marketing_platform",
+                    "marketing_001",
+                    "SUCCESS",
+                    "marketing_001 linked to person@example.test and user_001",
+                )
+            ]
+        )
+
+        investigation = investigate_case(
+            case, identity, evidence_index, activity_index
+        )
+
+        self.assertEqual("marketing_001", investigation.resources[0].resource_id)
+        self.assertEqual("UNKNOWN", investigation.resources[0].observed_state)
+        self.assertEqual((), investigation.resources[0].state_evidence_ids)
+
+    def test_activity_artifact_name_links_a_subject_attachment_to_ocr_image(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_object_image",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        identity = ResolvedIdentity(
+            "user_001",
+            {"name": "", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        evidence = EvidenceFile(
+            "evidence_object_image",
+            Path("object_storage.png"),
+            "test_fixture",
+            audit_at,
+            "delivery_confirmation_19.pdf\nObjects\nVersion v3",
+        )
+        activity = ActivityIndex(
+            [
+                ActivityEvent(
+                    "activity_object_link",
+                    audit_at,
+                    "LINK_RESOURCE_IDENTITY",
+                    "data_catalog",
+                    "object_storage",
+                    "object_19",
+                    "SUCCESS",
+                    "object_19 (delivery_confirmation_19.pdf) belongs to "
+                    "person@example.test and user_001.",
+                )
+            ]
+        )
+
+        investigation = investigate_case(
+            case, identity, EvidenceIndex([evidence]), activity
+        )
+
+        self.assertEqual(1, len(investigation.resources))
+        self.assertEqual("object_19", investigation.resources[0].resource_id)
+        self.assertEqual(("evidence_object_image",), investigation.resources[0].state_evidence_ids)
+        self.assertEqual("PRESENT", investigation.resources[0].observed_state)
+
+    def test_evidence_loader_attaches_ocr_text_to_manifest_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_root = Path(directory)
+            evidence_root = dataset_root / "evidence"
+            evidence_root.mkdir()
+            image_path = evidence_root / "screenshot.png"
+            image_path.write_bytes(b"test image")
+            manifest_path = dataset_root / "evidence_files.csv"
+            manifest_path.write_text(
+                "file_id,file_path,origin,captured_at\n"
+                "evidence_image,evidence/screenshot.png,test,"
+                "2026-01-03T00:00:00Z\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "main.extract_image_texts",
+                return_value={image_path.resolve(): "resource_id=marketing_001"},
+            ) as extract:
+                index = load_evidence_index(manifest_path, dataset_root)
+
+        self.assertEqual("resource_id=marketing_001", index.files[0].text)
+        extract.assert_called_once_with((image_path.resolve(),))
 
 
 class ContractTests(unittest.TestCase):

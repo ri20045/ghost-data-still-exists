@@ -13,10 +13,12 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unicodedata
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,8 +79,13 @@ TEXT_EVIDENCE_SUFFIXES = {".log", ".sql", ".txt"}
 # These are the resource namespaces represented by the participant-facing activity
 # stream and policy artifacts.  Deliberately exclude identity values such as user_05.
 RESOURCE_ID_PATTERN = re.compile(
-    r"\b(?:account|analytics|audit_record|backup|data_flow|export|legal_hold|search|support|tombstone)_\d+\b"
+    r"\b(?:account|analytics|audit_record|backup|data_flow|export|legal_hold|"
+    r"marketing|object|search|support|tombstone)_\d+\b"
 )
+ARTIFACT_NAME_PATTERN = re.compile(
+    r"\b[\w.-]+\.(?:pdf|zip|jpe?g|png|csv)\b", re.IGNORECASE
+)
+EMAIL_ADDRESS_PATTERN = re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", re.IGNORECASE)
 DELETION_MARKERS = (
     "delete", "deleted", "deleting", "deletion", "erase", "erased", "erasing", "erasure",
     "remove my", "remove any", "remove all", "remove the account", "remove this account",
@@ -122,6 +129,8 @@ PREFIX_TO_CATEGORY = {
     "data_flow": "DATA_FLOW",
     "export": "USER_EXPORT",
     "legal_hold": "LEGAL_HOLD_RECORD",
+    "marketing": "MARKETING_PROFILE",
+    "object": "SUPPORT_ATTACHMENT",
     "search": "SEARCH_INDEX_ENTRY",
     "support": "SUPPORT_MESSAGE",
     "tombstone": "ACCOUNT_TOMBSTONE",
@@ -130,6 +139,8 @@ PREFIX_TO_SYSTEM = {
     "account": "account_service", "analytics": "analytics_platform", "audit_record": "security_service",
     "backup": "backup_service", "data_flow": "integration_service", "export": "export_service",
     "legal_hold": "legal_service",
+    "marketing": "marketing_platform",
+    "object": "object_storage",
     "search": "search_service", "support": "support_platform", "tombstone": "identity_service",
 }
 
@@ -239,6 +250,18 @@ class EvidenceIndex:
             if evidence.captured_at <= audit_at
         ]
 
+    def search_content(self, terms: Iterable[str], audit_at: datetime) -> list[EvidenceFile]:
+        needles = tuple(term.casefold() for term in terms if term.strip())
+        if not needles:
+            return []
+        return [
+            evidence
+            for evidence in self.files
+            if evidence.captured_at <= audit_at
+            and evidence.text
+            and any(_identifier_in_text(evidence.text, needle) for needle in needles)
+        ]
+
 
 @dataclass(frozen=True)
 class ActivityEvent:
@@ -270,6 +293,7 @@ class ResourceObservation:
     state_evidence_ids: tuple[str, ...]
     retention_until: datetime | None = None
     policy_active: bool | None = None
+    evidence_link_terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -396,7 +420,13 @@ def _resource_state_from_result(result: str, resource_id: str) -> str:
     return "UNKNOWN"
 
 
-def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: bool = False) -> str:
+def _resource_state_from_text(
+    text: str,
+    resource_id: str,
+    *,
+    sql_statement: bool = False,
+    image_evidence: bool = False,
+) -> str:
     normalized = text.replace('\\"', '"').casefold()
     if resource_id.startswith("search_"):
         total_hits = re.search(
@@ -452,7 +482,10 @@ def _resource_state_from_text(text: str, resource_id: str, *, sql_statement: boo
         and re.search(r"\b(?:available|download_available)\s*=\s*[\"']?true\b", normalized)
     ):
         return "PRESENT"
-    if not resource_id.startswith(("data_flow_", "backup_")) and _text_has_direct_identifier(normalized):
+    if not resource_id.startswith(("data_flow_", "backup_")) and (
+        _text_has_direct_identifier(normalized)
+        or image_evidence and EMAIL_ADDRESS_PATTERN.search(normalized)
+    ):
         return "PRESENT"
     if result:
         state = _resource_state_from_result(result.group(1), resource_id)
@@ -750,7 +783,16 @@ def _resource_state_from_json_record(record: dict[str, Any], resource_id: str) -
     return "UNKNOWN"
 
 
-def _resource_state_in_evidence(evidence: EvidenceFile, resource_id: str) -> str:
+def _resource_state_in_evidence(
+    evidence: EvidenceFile,
+    resource_id: str,
+    evidence_link_terms: Iterable[str] = (),
+) -> str:
+    if evidence.path.suffix.casefold() == ".png" and any(
+        _identifier_in_text(evidence.text, term.casefold())
+        for term in evidence_link_terms
+    ):
+        return "PRESENT"
     records = _records_in_evidence(evidence, resource_id)
     states = [_resource_state_from_json_record(record, resource_id) for record in records]
     if evidence.path.suffix.casefold() not in {".json", ".sql"}:
@@ -761,6 +803,7 @@ def _resource_state_in_evidence(evidence: EvidenceFile, resource_id: str) -> str
                         line,
                         resource_id,
                         sql_statement=evidence.path.suffix.casefold() == ".sql",
+                        image_evidence=evidence.path.suffix.casefold() == ".png",
                     )
                 )
     elif evidence.path.suffix.casefold() == ".sql" and not records:
@@ -912,7 +955,14 @@ def reconstruct_resource_states(
     reconstructed: list[ResourceObservation] = []
     for resource in resources:
         evidence_states = [
-            (evidence_id, _resource_state_in_evidence(evidence_by_id[evidence_id], resource.resource_id))
+            (
+                evidence_id,
+                _resource_state_in_evidence(
+                    evidence_by_id[evidence_id],
+                    resource.resource_id,
+                    resource.evidence_link_terms,
+                ),
+            )
             for evidence_id in resource.evidence_ids
             if evidence_id in evidence_by_id
         ]
@@ -991,6 +1041,7 @@ def reconstruct_resource_states(
                 state_evidence_ids,
                 next(iter(retention_values), None),
                 next(iter(active_values), None),
+                resource.evidence_link_terms,
             )
         )
     return tuple(reconstructed)
@@ -1006,6 +1057,7 @@ def investigate_case(
     identifiers = (*identity.all_identifiers, identity.user_id)
     evidence = evidence_index.search(identifiers, case.audit_at)
     resource_evidence: dict[str, set[str]] = defaultdict(set)
+    resource_evidence_terms: dict[str, set[str]] = defaultdict(set)
     resource_activity: dict[str, set[str]] = defaultdict(set)
     for item in evidence:
         for resource_id in linked_resource_ids(item, identifiers):
@@ -1016,7 +1068,15 @@ def investigate_case(
             continue
         resource_activity[event.resource_id].add(event.activity_id)
         for item in evidence_index.for_resource(event.resource_id, case.audit_at):
+            if _image_has_conflicting_subject_email(item, identifiers):
+                continue
             resource_evidence[event.resource_id].add(item.file_id)
+        artifact_names = ARTIFACT_NAME_PATTERN.findall(event.details)
+        for item in evidence_index.search_content(artifact_names, case.audit_at):
+            if _image_has_conflicting_subject_email(item, identifiers):
+                continue
+            resource_evidence[event.resource_id].add(item.file_id)
+            resource_evidence_terms[event.resource_id].update(artifact_names)
 
     observations: list[ResourceObservation] = []
     for resource_id in sorted(resource_evidence.keys() | resource_activity.keys()):
@@ -1037,6 +1097,7 @@ def investigate_case(
                 latest_activity_claim=latest_claim,
                 observed_state="UNKNOWN",
                 state_evidence_ids=(),
+                evidence_link_terms=tuple(sorted(resource_evidence_terms[resource_id])),
             )
         )
     resource_observations = tuple(observations)
@@ -1045,6 +1106,23 @@ def investigate_case(
         evidence_ids=tuple(item.file_id for item in evidence),
         resources=reconstruct_resource_states(resource_observations, evidence_index),
     )
+
+
+def _image_has_conflicting_subject_email(
+    evidence: EvidenceFile, identifiers: Iterable[str]
+) -> bool:
+    if evidence.path.suffix.casefold() != ".png":
+        return False
+    image_emails = {
+        match.group(0).casefold()
+        for match in EMAIL_ADDRESS_PATTERN.finditer(evidence.text)
+    }
+    subject_emails = {
+        identifier.casefold()
+        for identifier in identifiers
+        if EMAIL_ADDRESS_PATTERN.fullmatch(identifier)
+    }
+    return bool(image_emails and not image_emails.intersection(subject_emails))
 
 
 def request_authorizes_deletion(request_text: str) -> bool:
@@ -1742,8 +1820,59 @@ def load_identity_resolver(identities_path: Path, audit_log_path: Path) -> Ident
     return IdentityResolver(snapshots, dict(changes))
 
 
-def extract_evidence_text(path: Path) -> str:
-    """Extract deterministic searchable text; image interpretation remains a later feature."""
+def extract_image_texts(paths: Iterable[Path]) -> dict[Path, str]:
+    """OCR manifest images with the macOS Vision framework when it is available."""
+    image_paths = tuple(paths)
+    if not image_paths:
+        return {}
+    swift = shutil.which("swift")
+    if sys.platform != "darwin" or swift is None:
+        warnings.warn(
+            "PNG evidence was not OCR-processed; image-only facts will remain unresolved.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {}
+
+    script_path = Path(__file__).resolve().with_name("image_ocr.swift")
+    if not script_path.is_file():
+        raise ContractError(f"missing image OCR helper: {script_path}")
+    try:
+        result = subprocess.run(
+            [swift, str(script_path), *(str(path) for path in image_paths)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip() or "no diagnostic output"
+        raise ContractError(f"image OCR failed: {detail}") from error
+    except subprocess.TimeoutExpired as error:
+        raise ContractError("image OCR exceeded the 120-second timeout") from error
+
+    try:
+        recognized = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ContractError("image OCR returned invalid JSON") from error
+    if (
+        not isinstance(recognized, list)
+        or len(recognized) != len(image_paths)
+        or any(
+            not isinstance(lines, list)
+            or any(not isinstance(line, str) for line in lines)
+            for lines in recognized
+        )
+    ):
+        raise ContractError("image OCR returned an invalid result shape")
+    return {
+        path: "\n".join(lines)
+        for path, lines in zip(image_paths, recognized)
+    }
+
+
+def extract_evidence_text(path: Path, *, image_text: str = "") -> str:
+    """Extract searchable text from supported participant-facing evidence."""
     suffix = path.suffix.casefold()
     if suffix in TEXT_EVIDENCE_SUFFIXES:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -1767,15 +1896,14 @@ def extract_evidence_text(path: Path) -> str:
             except Exception as error:  # pypdf exposes several format-specific exception classes.
                 raise ContractError(f"{path}: unable to extract PDF text") from error
     if suffix == ".png":
-        # PNGs need visual/OCR interpretation, deliberately deferred to the evidence-state feature.
-        return ""
+        return image_text
     raise ContractError(f"{path}: unsupported evidence type {suffix!r}")
 
 
 def load_evidence_index(manifest_path: Path, dataset_root: Path = DATASET_ROOT) -> EvidenceIndex:
     """Load only manifest-declared evidence and verify every path stays within dataset/evidence."""
     evidence_root = (dataset_root / "evidence").resolve()
-    files: list[EvidenceFile] = []
+    manifest_entries: list[tuple[str, Path, str, datetime]] = []
     with manifest_path.open(newline="", encoding="utf-8") as source:
         reader = csv.DictReader(source)
         if tuple(reader.fieldnames or ()) != EVIDENCE_COLUMNS:
@@ -1790,15 +1918,33 @@ def load_evidence_index(manifest_path: Path, dataset_root: Path = DATASET_ROOT) 
             if evidence_root not in resolved_path.parents or not resolved_path.is_file():
                 raise ContractError(f"{manifest_path}:{row_number}: invalid evidence path")
             file_ids.add(file_id)
-            files.append(
-                EvidenceFile(
-                    file_id=file_id,
-                    path=resolved_path,
-                    origin=row["origin"].strip(),
-                    captured_at=parse_timestamp(row["captured_at"], field_name="captured_at", case_id=file_id),
-                    text=extract_evidence_text(resolved_path),
+            manifest_entries.append(
+                (
+                    file_id,
+                    resolved_path,
+                    row["origin"].strip(),
+                    parse_timestamp(
+                        row["captured_at"], field_name="captured_at", case_id=file_id
+                    ),
                 )
             )
+    image_texts = extract_image_texts(
+        tuple(
+            path
+            for _, path, _, _ in manifest_entries
+            if path.suffix.casefold() == ".png"
+        )
+    )
+    files = [
+        EvidenceFile(
+            file_id=file_id,
+            path=path,
+            origin=origin,
+            captured_at=captured_at,
+            text=extract_evidence_text(path, image_text=image_texts.get(path, "")),
+        )
+        for file_id, path, origin, captured_at in manifest_entries
+    ]
     return EvidenceIndex(files)
 
 

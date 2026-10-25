@@ -24,6 +24,8 @@ Embedded JSON lookup records may encode row counts and HTTP status codes as stri
 
 Search evidence can also establish an index entry's state through an explicit `total_hits` count, whether it appears in a structured record or a log line. A positive count means the entry is present; zero means absent.
 
+On macOS, manifest-listed PNG screenshots are OCR-processed in one batch with the built-in Vision framework, without adding a Python package dependency. Recognized screenshot text participates in the same identifier, resource, and timestamp checks as other evidence; activity-linked attachment filenames can connect a screenshot to an object resource, while a screenshot showing a different subject email is not accepted as proof for that subject. Marketing-profile and object-storage resource IDs map to their supplied policy categories. OCR failures are reported explicitly. On platforms without macOS Vision, the loader warns and leaves image-only facts unresolved rather than inferring a state.
+
 For SQL snapshots that define `security_audit_records`, retention cutoffs are read from the `retention_until` column using that table's declared schema and matching resource row. Audit events from other tables or text that only reports an audit record as found do not establish a retention cutoff. The public sample's audit rows that omit this value therefore remain unresolved.
 
 The public sample has a source inconsistency: `sample_output.csv` cites `account_001` and `account_002` in `evidence_54` for its first two cases, but the participant-facing evidence file does not contain those resource IDs. The implementation does not use sample answers to fabricate evidence; clarify or correct this discrepancy before relying on full-dataset completion results.

@@ -1038,3 +1038,65 @@ branch=main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=/Users/riyarawat/hackerrank-orchestrate-october26
 parent_agent=none
+
+## [2026-10-25T07:36:55Z] Investigating unresolved evidence blockers
+
+User Prompt (verbatim, secrets redacted):
+lets work on resolveing blocked cases and completing a valid full-dataset run
+
+Agent Response Summary:
+Investigated the remaining no-linked-resource and unknown-state cases using participant-facing evidence only. The current diagnostic still has 201 blocked requests, predominantly because supplied retention cutoffs are absent; unresolved support readbacks and image-only leads also lack enough machine-readable evidence to safely classify. Existing tests passed, and full output generation correctly aborted without creating output.csv.
+
+Actions:
+* Inspected case/resource evidence links, activity leads, policy, image evidence, and OCR availability.
+* Ran the full-dataset coverage diagnostic and output-generation fail-closed check.
+* Ran core and evaluation unit tests.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none
+
+## [2026-10-25T07:39:02Z] Requesting retention evidence source
+
+User Prompt (verbatim, secrets redacted):
+provide_source
+
+Agent Response Summary:
+The user selected the option to supply an authoritative participant-facing retention source. I requested its exact path or URL, but no source location was provided, so retention-dependent cases remain blocked rather than using an unsupported default.
+
+Actions:
+* Used the structured ask_user form to request the source location.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none
+
+## [2026-10-25T07:59:36Z] Adding screenshot OCR evidence correlation
+
+User Prompt (verbatim, secrets redacted):
+yes implement further
+
+Agent Response Summary:
+Added batched macOS Vision OCR for manifest PNG evidence, with explicit fallback warnings and fail-closed error handling. OCR text is identity/resource/time filtered, and activity-linked attachment filenames can corroborate object-storage screenshots without accepting a screenshot that visibly belongs to another email subject. Added the marketing-profile and object-storage resource mappings. Coverage improved from 201 to 199 blocked cases; case_50 and case_61 now produce evidence-backed incomplete plans, while case_63 remains blocked due to a subject mismatch.
+
+Actions:
+* Edited code/main.py, code/image_ocr.swift, code/test_main.py, and README.md.
+* Ran 54 core tests and 3 evaluation tests; both suites passed.
+* Ran Python compilation, Swift type-check, git diff --check, the full coverage diagnostic, and a fail-closed output generation attempt.
+* Confirmed generation exits 2 with 199 blocked cases and does not create output.csv.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none
