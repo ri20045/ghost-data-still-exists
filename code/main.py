@@ -377,12 +377,19 @@ def linked_resource_ids(evidence: EvidenceFile, identifiers: Iterable[str]) -> s
 
         visit(document)
         return found
-    return {
+    found = {
         resource_id
         for line in evidence.text.splitlines()
         if any(_identifier_in_text(line, needle) for needle in needles)
         for resource_id in RESOURCE_ID_PATTERN.findall(line)
     }
+    if evidence.path.suffix.casefold() == ".png" and not found:
+        image_resources = _resource_ids_in_evidence(evidence)
+        if len(image_resources) == 1 and any(
+            _identifier_in_text(evidence.text, needle) for needle in needles
+        ):
+            found.update(image_resources)
+    return found
 
 
 def _identifier_in_text(text: str, identifier: str) -> bool:
@@ -437,9 +444,10 @@ def _resource_state_from_text(
     if resource_id.startswith("data_flow_"):
         if re.search(
             r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?active\b"
-            r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?true\b",
+            r"|\b(?:enabled|scheduler_registered)\s*=\s*[\"']?true\b"
+            r"|\bsync\s+mode\s+continuous(?:\s+sync)?\b",
             normalized,
-        ):
+        ) or image_evidence and re.search(r"\bcontinuous(?:\s+sync)?\b", normalized):
             return "ACTIVE"
         if re.search(
             r"\b(?:state|status|flow_state)\s*[:=]\s*[\"']?(?:disabled|inactive)\b"
@@ -480,6 +488,10 @@ def _resource_state_from_text(
     if (
         resource_id.startswith("export_")
         and re.search(r"\b(?:available|download_available)\s*=\s*[\"']?true\b", normalized)
+    ):
+        return "PRESENT"
+    if resource_id.startswith("export_") and image_evidence and re.search(
+        r"\b(?:ready|collecting|processing|packaging)\b", normalized
     ):
         return "PRESENT"
     if not resource_id.startswith(("data_flow_", "backup_")) and (
@@ -788,9 +800,13 @@ def _resource_state_in_evidence(
     resource_id: str,
     evidence_link_terms: Iterable[str] = (),
 ) -> str:
-    if evidence.path.suffix.casefold() == ".png" and any(
-        _identifier_in_text(evidence.text, term.casefold())
-        for term in evidence_link_terms
+    if (
+        evidence.path.suffix.casefold() == ".png"
+        and not resource_id.startswith(("data_flow_", "backup_"))
+        and any(
+            _identifier_in_text(evidence.text, term.casefold())
+            for term in evidence_link_terms
+        )
     ):
         return "PRESENT"
     records = _records_in_evidence(evidence, resource_id)
@@ -966,7 +982,7 @@ def reconstruct_resource_states(
             for evidence_id in resource.evidence_ids
             if evidence_id in evidence_by_id
         ]
-        states = {state for _, state in evidence_states}
+        states = {state for _, state in evidence_states} - {"UNKNOWN"}
         if resource.resource_id.startswith("data_flow_") and "ACTIVE" in states:
             state = "ACTIVE"
         elif resource.resource_id.startswith("data_flow_") and states and states <= {"INACTIVE"}:
@@ -1060,8 +1076,16 @@ def investigate_case(
     resource_evidence_terms: dict[str, set[str]] = defaultdict(set)
     resource_activity: dict[str, set[str]] = defaultdict(set)
     for item in evidence:
+        if _image_has_conflicting_subject_email(item, identifiers):
+            continue
         for resource_id in linked_resource_ids(item, identifiers):
             resource_evidence[resource_id].add(item.file_id)
+            if item.path.suffix.casefold() == ".png":
+                resource_evidence_terms[resource_id].update(
+                    identifier
+                    for identifier in identifiers
+                    if _identifier_in_text(item.text, identifier.casefold())
+                )
 
     for event in activity_index.linked_to_identifiers(identifiers, case.audit_at):
         if not RESOURCE_ID_PATTERN.fullmatch(event.resource_id):

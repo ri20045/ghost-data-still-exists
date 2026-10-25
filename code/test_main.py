@@ -25,6 +25,7 @@ from main import (
     load_identity_resolver,
     load_requests,
     extract_image_texts,
+    linked_resource_ids,
     investigate_case,
     orchestrate_case,
     orchestrate_cases,
@@ -82,6 +83,136 @@ class ImageEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual("PRESENT", resources[0].observed_state)
+
+    def test_image_identity_link_does_not_hide_connector_activity_state(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_flow_image",
+            Path("connector.png"),
+            "test_fixture",
+            audit_at,
+            "data_flow_001 customer@example.test Continuous 1,284",
+        )
+        resource = reconstruct_resource_states(
+            [
+                ResourceObservation(
+                    "data_flow_001",
+                    ("evidence_flow_image",),
+                    (),
+                    None,
+                    "UNKNOWN",
+                    (),
+                    evidence_link_terms=("customer@example.test",),
+                )
+            ],
+            EvidenceIndex([evidence]),
+        )[0]
+
+        self.assertEqual("ACTIVE", resource.observed_state)
+
+    def test_image_table_rows_reconstruct_search_export_and_flow_states(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence = EvidenceFile(
+            "evidence_image_rows",
+            Path("screenshot.png"),
+            "test_fixture",
+            audit_at,
+            "\n".join(
+                (
+                    "search_428 Gabriel Silva g.silva76@gmail.com user_13",
+                    "export_1260 customer_export_1260.zip ingrid.dahl@outlook.com Ready",
+                    "data_flow_1121 customer_analytics_warehouse jain.aditi@gmail.com "
+                    "Continuous 1,284",
+                    "support_1034 Kofi Agyeman kagyeman@example.test",
+                )
+            ),
+        )
+        resource_ids = (
+            "search_428",
+            "export_1260",
+            "data_flow_1121",
+            "support_1034",
+        )
+        resources = reconstruct_resource_states(
+            [
+                ResourceObservation(resource_id, ("evidence_image_rows",), (), None, "UNKNOWN", ())
+                for resource_id in resource_ids
+            ],
+            EvidenceIndex([evidence]),
+        )
+
+        self.assertEqual(
+            ["PRESENT", "PRESENT", "ACTIVE", "PRESENT"],
+            [resource.observed_state for resource in resources],
+        )
+
+    def test_image_can_link_a_unique_resource_across_visual_rows(self):
+        evidence = EvidenceFile(
+            "evidence_image_unique",
+            Path("screenshot.png"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            "support_1034 • Customer support ticket\n"
+            "person@example.test\n"
+            "Message: please update my delivery address.",
+        )
+
+        self.assertEqual(
+            {"support_1034"},
+            linked_resource_ids(evidence, ("person@example.test",)),
+        )
+
+    def test_image_does_not_broad_link_multiple_resources_across_rows(self):
+        evidence = EvidenceFile(
+            "evidence_image_multiple",
+            Path("screenshot.png"),
+            "test_fixture",
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            "search_001 another@example.test\n"
+            "search_002 person@example.test",
+        )
+
+        self.assertEqual(
+            {"search_002"},
+            linked_resource_ids(evidence, ("person@example.test",)),
+        )
+
+    def test_unknown_image_signal_does_not_override_explicit_absence(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_lookup",
+                    Path("lookup.log"),
+                    "test_fixture",
+                    audit_at,
+                    "resource_id=account_001 rows=0 http_status=404",
+                ),
+                EvidenceFile(
+                    "evidence_image",
+                    Path("screenshot.png"),
+                    "test_fixture",
+                    audit_at,
+                    "account_001\nAccount profile",
+                ),
+            ]
+        )
+        resource = reconstruct_resource_states(
+            [
+                ResourceObservation(
+                    "account_001",
+                    ("evidence_lookup", "evidence_image"),
+                    (),
+                    None,
+                    "UNKNOWN",
+                    (),
+                )
+            ],
+            evidence_index,
+        )[0]
+
+        self.assertEqual("ABSENT", resource.observed_state)
+        self.assertEqual(("evidence_lookup",), resource.state_evidence_ids)
 
     def test_unrelated_profile_screenshot_does_not_confirm_activity_lead(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)

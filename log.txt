@@ -1100,3 +1100,25 @@ branch=main
 repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
 worktree=/Users/riyarawat/hackerrank-orchestrate-october26
 parent_agent=none
+
+## [2026-10-25T08:21:42Z] Improving OCR row-level resource evidence
+
+User Prompt (verbatim, secrets redacted):
+yes implement
+
+Agent Response Summary:
+Improved screenshot OCR by grouping text cells into visual rows and using those rows for case/resource correlation and explicit state parsing. This resolved several previously blocked screenshot-backed cases while preserving fail-closed treatment for missing retention cutoffs, activity-only resources, and ambiguous screenshots. Full-dataset generation remains blocked; no output.csv was created.
+
+Actions:
+* Edited code/image_ocr.swift, code/main.py, code/test_main.py, and README.md.
+* Ran 59 core tests and 3 evaluation tests; both suites passed.
+* Ran Python compilation, Swift type-check, git diff --check, and a 518-request coverage diagnostic.
+* Attempted full output generation; it exited 2 with 195 unresolved cases and created no output.csv.
+
+Context:
+tool=GitHub Copilot in VS Code
+model=not exposed by runtime
+branch=main
+repo_root=/Users/riyarawat/hackerrank-orchestrate-october26
+worktree=/Users/riyarawat/hackerrank-orchestrate-october26
+parent_agent=none
