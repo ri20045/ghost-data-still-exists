@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -1084,7 +1086,7 @@ def orchestrate_cases(
     rules: Iterable[DeletionRule],
 ) -> list[OutputRow]:
     """Build a validated batch of rows, failing without returning partial output."""
-    ordered_cases = list(cases)
+    ordered_cases = sorted(cases, key=lambda case: case.case_id)
     rules_list = list(rules)
     rows = []
     failures: list[tuple[str, str]] = []
@@ -1892,6 +1894,42 @@ def read_output_rows(path: Path) -> list[OutputRow]:
     return rows
 
 
+def write_output_rows(
+    path: Path, cases: Iterable[AuditCase], rows: Iterable[OutputRow]
+) -> None:
+    """Write a fully validated output atomically, leaving prior files untouched on failure."""
+    ordered_cases = sorted(cases, key=lambda case: case.case_id)
+    ordered_rows = sorted(rows, key=lambda row: row.case_id)
+    validated_rows = validate_output_rows(ordered_cases, ordered_rows)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as destination:
+            temporary_path = Path(destination.name)
+            writer = csv.writer(destination, lineterminator="\n")
+            writer.writerow(OUTPUT_COLUMNS)
+            for row in validated_rows:
+                writer.writerow(
+                    (
+                        row.case_id,
+                        row.deletion_status,
+                        json.dumps(row.steps, ensure_ascii=False, separators=(",", ":")),
+                    )
+                )
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def compare_outputs(expected_path: Path, actual_path: Path) -> list[str]:
     """Return semantic row differences; JSON object-key order does not matter."""
     expected = read_output_rows(expected_path)
@@ -1914,6 +1952,12 @@ def main() -> int:
     parser.add_argument("--inspect-evidence", metavar="CASE_ID", help="count text evidence linked to a resolved case at audit_at")
     parser.add_argument("--investigate-case", metavar="CASE_ID", help="list evidence-grounded resource candidates and activity claims")
     parser.add_argument("--plan-case", metavar="CASE_ID", help="build a policy-based plan for an investigated case")
+    parser.add_argument(
+        "--generate-output",
+        type=Path,
+        metavar="PATH",
+        help="plan all requests and atomically write validated CSV rows to PATH",
+    )
     parser.add_argument(
         "--diagnose-coverage",
         action="store_true",
@@ -2002,6 +2046,16 @@ def main() -> int:
                             print(f"    evidence needed: {item.evidence_needed}")
             if args.require_resolved_coverage:
                 require_output_eligible_coverage(diagnostics)
+        if args.generate_output:
+            rows = orchestrate_cases(
+                cases,
+                load_identity_resolver(DATASET_ROOT / "user_identities.csv", DATASET_ROOT / "user_audit_log.csv"),
+                load_evidence_index(DATASET_ROOT / "evidence_files.csv"),
+                load_activity_index(DATASET_ROOT / "system_activity.csv"),
+                load_deletion_rules(DATASET_ROOT / "deletion_rules.csv"),
+            )
+            write_output_rows(args.generate_output, cases, rows)
+            print(f"Wrote {len(rows)} validated output row(s) to {args.generate_output}")
         if args.validate_output:
             validate_output_rows(cases, read_output_rows(args.validate_output))
         if args.compare_sample:

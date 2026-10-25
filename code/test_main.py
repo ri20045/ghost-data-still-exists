@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,10 +28,12 @@ from main import (
     orchestrate_case,
     orchestrate_cases,
     plan_investigation,
+    read_output_rows,
     reconstruct_resource_states,
     request_authorizes_deletion,
     validate_output_rows,
     validate_steps,
+    write_output_rows,
 )
 
 
@@ -72,7 +75,7 @@ class ContractTests(unittest.TestCase):
                 audit_at=audit_at,
                 request_text="Please provide a copy of my account data.",
             )
-            for index in range(1, 3)
+            for index in (2, 1)
         ]
         expected_rows = [
             OutputRow("case_1", "NOT_APPLICABLE", []),
@@ -81,7 +84,13 @@ class ContractTests(unittest.TestCase):
         with patch("main.orchestrate_case", side_effect=expected_rows) as orchestrate:
             rows = orchestrate_cases(cases, Mock(), Mock(), Mock(), [])
 
-        self.assertEqual(expected_rows, rows)
+        self.assertEqual(
+            [
+                OutputRow("case_1", "NOT_APPLICABLE", []),
+                OutputRow("case_2", "NOT_APPLICABLE", []),
+            ],
+            rows,
+        )
         self.assertEqual(2, orchestrate.call_count)
 
     def test_batch_orchestration_fails_without_returning_partial_rows(self):
@@ -113,6 +122,112 @@ class ContractTests(unittest.TestCase):
                 orchestrate_cases(cases, Mock(), Mock(), Mock(), [])
 
         self.assertEqual(3, orchestrate.call_count)
+
+    def test_writes_validated_rows_as_contract_csv(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please provide a copy of my account data.",
+            )
+            for index in range(1, 3)
+        ]
+        rows = [
+            OutputRow(
+                "case_2",
+                "COMPLETE",
+                [
+                    {
+                        "step_no": 1,
+                        "phase": "VERIFICATION",
+                        "system_id": "account_service",
+                        "resource_id": "account_002",
+                        "operation": "VERIFY_RECORD_ABSENT",
+                        "state": "ABSENT",
+                        "evidence_id": "evidence_002",
+                    }
+                ],
+            ),
+            OutputRow("case_1", "NOT_APPLICABLE", []),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "output.csv"
+            write_output_rows(output_path, cases, rows)
+
+            self.assertEqual(
+                [OutputRow("case_1", "NOT_APPLICABLE", []), rows[0]],
+                read_output_rows(output_path),
+            )
+            with output_path.open(encoding="utf-8") as output:
+                self.assertEqual(
+                    "case_id,deletion_status,steps_json\n"
+                    'case_1,NOT_APPLICABLE,[]\n'
+                    'case_2,COMPLETE,"[{""step_no"":1,""phase"":""VERIFICATION"",'
+                    '""system_id"":""account_service"",""resource_id"":""account_002"",'
+                    '""operation"":""VERIFY_RECORD_ABSENT"",""state"":""ABSENT"",'
+                    '""evidence_id"":""evidence_002""}]"\n',
+                    output.read(),
+                )
+
+    def test_does_not_replace_output_when_rows_fail_validation(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_1",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please provide a copy of my account data.",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "output.csv"
+            output_path.write_text("existing output\n", encoding="utf-8")
+
+            with self.assertRaises(ContractError):
+                write_output_rows(
+                    output_path,
+                    [case],
+                    [OutputRow("wrong_case", "NOT_APPLICABLE", [])],
+                )
+
+            self.assertEqual("existing output\n", output_path.read_text(encoding="utf-8"))
+
+    def test_batch_csv_writer_outputs_518_sorted_rows(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        cases = [
+            AuditCase(
+                case_id=f"case_{index:03d}",
+                email=f"person{index}@example.test",
+                requested_at=audit_at,
+                reported_status="COMPLETE",
+                reported_at=audit_at,
+                audit_at=audit_at,
+                request_text="Please provide a copy of my account data.",
+            )
+            for index in range(518, 0, -1)
+        ]
+        with patch(
+            "main.orchestrate_case",
+            side_effect=lambda case, *_: OutputRow(case.case_id, "NOT_APPLICABLE", []),
+        ):
+            rows = orchestrate_cases(cases, Mock(), Mock(), Mock(), [])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "output.csv"
+            write_output_rows(output_path, cases, rows)
+            written_rows = read_output_rows(output_path)
+
+        self.assertEqual(518, len(written_rows))
+        self.assertEqual(
+            sorted(case.case_id for case in cases),
+            [row.case_id for row in written_rows],
+        )
+        self.assertTrue(all(row.deletion_status == "NOT_APPLICABLE" for row in written_rows))
 
     def test_coverage_diagnostic_separates_blocked_cases_from_errors(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)

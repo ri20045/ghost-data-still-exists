@@ -12,7 +12,7 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 Request intent is determined with deterministic multilingual rules. The classifier recognizes deletion and deletion-audit wording while excluding requests for access, correction, export, marketing opt-out, and explicit instructions not to delete.
 
-Single-case orchestration correlates resources through direct identity matches and identity-linked activity references. Activity can identify a resource to inspect, but only resource-specific participant evidence captured by `audit_at` can establish its state. The planner applies the supplied delete/redact/anonymize/retain rules and emits verification for discovered resources that meet policy. Tombstones are correlated by their stable `user_id`; retention cutoffs, active legal holds, and blocked backup restores are checked explicitly. Unknown state or policy conditions prevent a completion decision. Batch row planning now validates the complete ordered result and fails without returning partial rows if any case is unresolved; CSV writing is not implemented yet.
+Single-case orchestration correlates resources through direct identity matches and identity-linked activity references. Activity can identify a resource to inspect, but only resource-specific participant evidence captured by `audit_at` can establish its state. The planner applies the supplied delete/redact/anonymize/retain rules and emits verification for discovered resources that meet policy. Tombstones are correlated by their stable `user_id`; retention cutoffs, active legal holds, and blocked backup restores are checked explicitly. Unknown state or policy conditions prevent a completion decision. Batch row planning validates the complete ordered result and fails without returning partial rows if any case is unresolved. `--generate-output PATH` writes only a fully planned and validated batch, using an atomic replacement so failures cannot leave a partial CSV.
 
 Evidence-state reconstruction also reads nested JSON records and export-job fields, including explicit profile lookup status codes, and recognizes the status column in pipe-delimited inventory records. These formats are interpreted conservatively: identity-linked activity remains a discovery lead, and missing or conflicting state evidence is not treated as proof of deletion.
 
@@ -66,6 +66,7 @@ python3 code/main.py --inspect-evidence case_33
 python3 code/main.py --investigate-case case_05
 python3 code/main.py --plan-case case_05
 python3 code/main.py --diagnose-coverage
+python3 code/main.py --generate-output output.csv
 python3 code/main.py --requests dataset/sample_deletion_requests.csv --diagnose-coverage
 python3 -m unittest discover -s code -p 'test_*.py'
 ```
