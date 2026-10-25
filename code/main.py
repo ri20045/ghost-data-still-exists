@@ -1279,6 +1279,51 @@ def _diagnostic_evidence_assessment(
     )
 
 
+def _diagnostic_unlinked_evidence_assessment(
+    evidence_files: Iterable[EvidenceFile], identifiers: Iterable[str]
+) -> tuple[str, str, str]:
+    files = tuple(evidence_files)
+    normalized_identifiers = tuple(identifier for identifier in identifiers if identifier)
+    matching_lines = [
+        line.replace('\\"', '"')
+        for evidence in files
+        for line in evidence.text.splitlines()
+        if any(_identifier_in_text(line, identifier) for identifier in normalized_identifiers)
+    ]
+    started_events = [
+        line
+        for line in matching_lines
+        if re.search(
+            r"\bevent\s*[=:]\s*[\"']?[\w-]+_started\b",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+    if started_events and not any(
+        RESOURCE_ID_PATTERN.search(line) for line in matching_lines
+    ):
+        return (
+            "IDENTITY_LOOKUP_WITHOUT_RESOURCE_LINK",
+            "Identity-linked evidence records lookup attempts but supplies no resource ID "
+            "or completed readback; an attempt does not establish resource state.",
+            "Participant-facing completed readback that links this subject to a resource and "
+            "records its state by audit_at.",
+        )
+    if files:
+        return (
+            "IDENTITY_EVIDENCE_WITHOUT_RESOURCE_LINK",
+            "Identity-linked evidence exists, but it does not connect the subject to a "
+            "resource whose state can be evaluated.",
+            "Participant-facing evidence that links this subject to a resource and establishes "
+            "its state by audit_at.",
+        )
+    return (
+        "NO_IDENTITY_EVIDENCE",
+        "No participant-facing evidence captured by audit_at matches the subject identifiers.",
+        "Participant-facing evidence linking a subject identifier to a relevant resource.",
+    )
+
+
 def _diagnostic_retention_assessment(
     resource_id: str, evidence_files: Iterable[EvidenceFile]
 ) -> tuple[str, str]:
@@ -1405,6 +1450,22 @@ def diagnose_case_coverage(
                     evidence_index.for_resource(resource_id, case.audit_at),
                 )
                 evidence_needed = _retention_evidence_needed(evidence_assessment)
+            elif reason_code == "NO_LINKED_RESOURCE":
+                identity = identity_resolver.resolve(case.email, case.audit_at)
+                identity_evidence = evidence_index.search(
+                    (*identity.all_identifiers, identity.user_id), case.audit_at
+                )
+                evidence_ids = tuple(
+                    sorted(item.file_id for item in identity_evidence)
+                )
+                (
+                    evidence_assessment,
+                    evidence_note,
+                    evidence_needed,
+                ) = _diagnostic_unlinked_evidence_assessment(
+                    identity_evidence,
+                    (*identity.all_identifiers, identity.user_id),
+                )
             diagnostics.append(
                 CaseCoverageDiagnostic(
                     case.case_id,

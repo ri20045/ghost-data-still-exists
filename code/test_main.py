@@ -631,6 +631,56 @@ class ContractTests(unittest.TestCase):
         self.assertIn("omits message content", diagnostics[0].evidence_note)
         self.assertIn("No participant-facing evidence", diagnostics[1].evidence_note)
 
+    def test_coverage_diagnostic_identifies_identity_lookup_attempts_without_results(self):
+        audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        case = AuditCase(
+            "case_lookup_only",
+            "person@example.test",
+            audit_at,
+            "COMPLETE",
+            audit_at,
+            audit_at,
+            "Please delete my account.",
+        )
+        identity = ResolvedIdentity(
+            "user_001",
+            {"name": "", "email": case.email, "phone": "", "email_hash": ""},
+            {},
+        )
+        resolver = Mock()
+        resolver.resolve.return_value = identity
+        evidence_index = EvidenceIndex(
+            [
+                EvidenceFile(
+                    "evidence_lookup_attempt",
+                    Path("lookup.log"),
+                    "test_fixture",
+                    audit_at,
+                    'event=profile_lookup_started lookup_key="person@example.test" '
+                    'trace_id="trace-1"',
+                )
+            ]
+        )
+        with patch(
+            "main.orchestrate_case",
+            side_effect=ContractError(
+                "case_lookup_only: no evidence-backed resources establish the required deletion state"
+            ),
+        ):
+            diagnostic = diagnose_case_coverage(
+                [case], resolver, evidence_index, ActivityIndex([]), []
+            )[0]
+
+        self.assertEqual("BLOCKED", diagnostic.outcome)
+        self.assertEqual("NO_LINKED_RESOURCE", diagnostic.reason_code)
+        self.assertEqual(("evidence_lookup_attempt",), diagnostic.evidence_ids)
+        self.assertEqual(
+            "IDENTITY_LOOKUP_WITHOUT_RESOURCE_LINK",
+            diagnostic.evidence_assessment,
+        )
+        self.assertIn("does not establish resource state", diagnostic.evidence_note)
+        self.assertIn("completed readback", diagnostic.evidence_needed)
+
     def test_coverage_diagnostic_distinguishes_missing_retention_cutoff_evidence(self):
         audit_at = datetime(2026, 1, 3, tzinfo=timezone.utc)
         cases = [
